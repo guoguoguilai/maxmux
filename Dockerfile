@@ -7,4 +7,6 @@ RUN CGO_ENABLED=0 go build -ldflags="-s -w" -o maxmux .
 
 FROM alpine:3.23
 COPY --from=build /app/maxmux /usr/local/bin/maxmux
+RUN mkdir -p /data
+VOLUME ["/data"]
 ENTRYPOINT ["maxmux"]
