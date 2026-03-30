@@ -1,6 +1,13 @@
 port: 4000
 upstream: https://api.anthropic.com
 oauth_token: sk-ant-oat01-YOUR-TOKEN-HERE
+
+admin:
+  username: admin
+  password: pageguo
+
 virtual_keys:
-  - sk-proxy-key-1
-  - sk-proxy-key-2
+  - name: Alice
+    key: sk-proxy-key-1
+  - name: Bob
+    key: sk-proxy-key-2
