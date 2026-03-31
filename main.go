@@ -1471,14 +1471,18 @@ function showDashboard() {
   document.getElementById('dashboard').style.display = 'block';
   loadKeys();
   loadToken();
-  refreshTimer = setInterval(loadKeys, 10000);
+  refreshTimer = setInterval(loadKeys, 30000);
 }
 
 async function loadKeys() {
   const url = currentSince > 0 ? API + '/keys?since=' + currentSince : API + '/keys';
   const res = await fetch(url);
   if (!res.ok) {
-    if (res.status === 401) { logout(); }
+    if (res.status === 401) {
+      // Confirm session is truly invalid before logging out.
+      const check = await fetch(API + '/session');
+      if (!check.ok) logout();
+    }
     return;
   }
   const keys = await res.json();
