@@ -1595,8 +1595,14 @@ async function logout() {
 }
 
 async function checkSession() {
-  const res = await fetch(API + '/session');
-  if (res.ok) showDashboard();
+  for (let i = 0; i < 3; i++) {
+    try {
+      const res = await fetch(API + '/session');
+      if (res.ok) { showDashboard(); return; }
+      if (res.status === 401) return; // definitively not logged in
+    } catch(e) { /* network error, retry */ }
+    await new Promise(r => setTimeout(r, 500));
+  }
 }
 
 function showDashboard() {
@@ -1613,15 +1619,9 @@ async function loadKeys() {
   let res;
   try { res = await fetch(url); } catch(e) { return; }
   if (!res.ok) {
-    if (res.status === 401) {
-      // Only logout if the session is definitively invalid (not a transient error).
-      try {
-        const check = await fetch(API + '/session');
-        if (check.status === 401) logout();
-        // Any other status (5xx, network error) = keep the session alive.
-      } catch(e) { /* network error, don't logout */ }
-    }
-    // Non-401 errors (5xx, etc.) are transient — don't logout.
+    // Background polling failures (including 401) are silently ignored.
+    // The user will only be logged out when they explicitly trigger an action
+    // and the server confirms the session is invalid via /admin/api/session.
     return;
   }
   const keys = await res.json();
