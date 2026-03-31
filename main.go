@@ -880,7 +880,7 @@ func main() {
 				Value:    token,
 				Path:     "/",
 				HttpOnly: true,
-				SameSite: http.SameSiteStrictMode,
+				SameSite: http.SameSiteLaxMode,
 				MaxAge:   86400,
 			})
 			log.Info().Str("username", req.Username).Msg("admin login success")
@@ -1480,6 +1480,7 @@ async function checkSession() {
 }
 
 function showDashboard() {
+  if (refreshTimer) clearInterval(refreshTimer);
   document.getElementById('loginPage').style.display = 'none';
   document.getElementById('dashboard').style.display = 'block';
   loadKeys();
