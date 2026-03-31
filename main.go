@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"crypto/rand"
 	"database/sql"
 	"encoding/hex"
@@ -9,6 +10,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
@@ -70,6 +72,7 @@ type KeyStats struct {
 	CacheCreationInputTokens int64                 `json:"cache_creation_input_tokens"`
 	CacheReadInputTokens     int64                 `json:"cache_read_input_tokens"`
 	ByModel                  map[string]ModelUsage `json:"by_model"`
+	LastActive               time.Time             `json:"last_active,omitempty"`
 }
 
 // Store handles all persistent data via SQLite.
@@ -276,7 +279,8 @@ func (s *Store) QueryAll(since time.Time) (map[string]KeyStats, error) {
 			`SELECT virtual_key, model,
 				COUNT(*) as cnt,
 				SUM(input_tokens), SUM(output_tokens),
-				SUM(cache_creation_input_tokens), SUM(cache_read_input_tokens)
+				SUM(cache_creation_input_tokens), SUM(cache_read_input_tokens),
+				MAX(timestamp)
 			 FROM usage_records
 			 GROUP BY virtual_key, model`)
 	} else {
@@ -284,7 +288,8 @@ func (s *Store) QueryAll(since time.Time) (map[string]KeyStats, error) {
 			`SELECT virtual_key, model,
 				COUNT(*) as cnt,
 				SUM(input_tokens), SUM(output_tokens),
-				SUM(cache_creation_input_tokens), SUM(cache_read_input_tokens)
+				SUM(cache_creation_input_tokens), SUM(cache_read_input_tokens),
+				MAX(timestamp)
 			 FROM usage_records
 			 WHERE timestamp >= ?
 			 GROUP BY virtual_key, model`, sinceStr)
@@ -298,7 +303,8 @@ func (s *Store) QueryAll(since time.Time) (map[string]KeyStats, error) {
 	for rows.Next() {
 		var vk, model string
 		var cnt, inTok, outTok, cacheCreate, cacheRead int64
-		if err := rows.Scan(&vk, &model, &cnt, &inTok, &outTok, &cacheCreate, &cacheRead); err != nil {
+		var lastActiveStr *string
+		if err := rows.Scan(&vk, &model, &cnt, &inTok, &outTok, &cacheCreate, &cacheRead, &lastActiveStr); err != nil {
 			return nil, err
 		}
 		ks := result[vk]
@@ -310,6 +316,13 @@ func (s *Store) QueryAll(since time.Time) (map[string]KeyStats, error) {
 		ks.OutputTokens += outTok
 		ks.CacheCreationInputTokens += cacheCreate
 		ks.CacheReadInputTokens += cacheRead
+		if lastActiveStr != nil {
+			if t, err := time.Parse(time.RFC3339Nano, *lastActiveStr); err == nil {
+				if t.After(ks.LastActive) {
+					ks.LastActive = t
+				}
+			}
+		}
 		if model != "" {
 			m := ks.ByModel[model]
 			m.InputTokens += inTok
@@ -494,6 +507,10 @@ func extractFromBody(body []byte) (model string, inputTokens, outputTokens, cach
 type sseUsageReader struct {
 	reader                   io.ReadCloser
 	virtualKey               string
+	keyName                  string
+	start                    time.Time
+	method                   string
+	path                     string
 	store                    *Store
 	log                      *zerolog.Logger
 	buf                      []byte
@@ -575,16 +592,19 @@ func (r *sseUsageReader) recordUsage() {
 	if err := r.store.AddRecord(r.virtualKey, rec); err != nil {
 		r.log.Error().Err(err).Msg("failed to record usage")
 	}
-	if r.inputTokens > 0 || r.outputTokens > 0 || r.cacheCreationInputTokens > 0 || r.cacheReadInputTokens > 0 {
-		r.log.Info().
-			Str("key", maskToken(r.virtualKey)).
-			Str("model", r.model).
-			Int64("input_tokens", r.inputTokens).
-			Int64("output_tokens", r.outputTokens).
-			Int64("cache_creation", r.cacheCreationInputTokens).
-			Int64("cache_read", r.cacheReadInputTokens).
-			Msg("usage recorded")
-	}
+	cost := calcModelCost(r.model, r.inputTokens, r.outputTokens, r.cacheCreationInputTokens, r.cacheReadInputTokens)
+	r.log.Info().
+		Str("key", r.keyName).
+		Str("method", r.method).
+		Str("path", r.path).
+		Dur("duration", time.Since(r.start)).
+		Str("model", r.model).
+		Int64("input_tokens", r.inputTokens).
+		Int64("output_tokens", r.outputTokens).
+		Int64("cache_creation", r.cacheCreationInputTokens).
+		Int64("cache_read", r.cacheReadInputTokens).
+		Float64("cost_usd", math.Round(cost*1000000)/1000000).
+		Msg("completed")
 }
 
 func (r *sseUsageReader) Close() error {
@@ -656,6 +676,8 @@ func calcModelCost(model string, inputTokens, outputTokens, cacheWrite, cacheRea
 		float64(cacheWrite)*inp*1.25 +
 		float64(cacheRead)*inp*0.1) / 1_000_000
 }
+
+type ctxStartKey struct{}
 
 func maskToken(t string) string {
 	if len(t) <= 16 {
@@ -777,6 +799,15 @@ func main() {
 				return nil
 			}
 
+			// Resolve key name for logging.
+			resolvedName := maskToken(virtualKey)
+			for _, k := range keyMgr.List() {
+				if k.Key == virtualKey {
+					resolvedName = k.Name
+					break
+				}
+			}
+
 			contentType := resp.Header.Get("Content-Type")
 			isStreaming := strings.Contains(contentType, "text/event-stream")
 
@@ -784,6 +815,10 @@ func main() {
 				resp.Body = &sseUsageReader{
 					reader:     resp.Body,
 					virtualKey: virtualKey,
+					keyName:    resolvedName,
+					start:      resp.Request.Context().Value(ctxStartKey{}).(time.Time),
+					method:     resp.Request.Method,
+					path:       resp.Request.URL.Path,
 					store:      store,
 					log:        &log,
 				}
@@ -795,26 +830,48 @@ func main() {
 				}
 
 				model, inputTokens, outputTokens, cacheCreation, cacheRead := extractFromBody(body)
-				rec := UsageRecord{
-					Timestamp:                time.Now(),
-					Model:                    model,
-					InputTokens:              inputTokens,
-					OutputTokens:             outputTokens,
-					CacheCreationInputTokens: cacheCreation,
-					CacheReadInputTokens:     cacheRead,
+				reqStart, _ := resp.Request.Context().Value(ctxStartKey{}).(time.Time)
+				if resp.StatusCode == http.StatusTooManyRequests {
+					// Strip retry headers so the SDK does not back-off and retry endlessly.
+					resp.Header.Del("Retry-After")
+					resp.Header.Del("X-Ratelimit-Reset-Requests")
+					resp.Header.Del("X-Ratelimit-Reset-Tokens")
 				}
-				if err := store.AddRecord(virtualKey, rec); err != nil {
-					log.Error().Err(err).Msg("failed to record usage")
-				}
-				if inputTokens > 0 || outputTokens > 0 || cacheCreation > 0 || cacheRead > 0 {
+				if resp.StatusCode >= 400 {
+					// Error response — log as warning, no usage to record.
+					log.Error().
+						Str("key", resolvedName).
+						Str("method", resp.Request.Method).
+						Str("path", resp.Request.URL.Path).
+						Dur("duration", time.Since(reqStart)).
+						Int("status", resp.StatusCode).
+						Str("error", string(body[:min(200, len(body))])).
+						Msg("upstream error response")
+				} else {
+					rec := UsageRecord{
+						Timestamp:                time.Now(),
+						Model:                    model,
+						InputTokens:              inputTokens,
+						OutputTokens:             outputTokens,
+						CacheCreationInputTokens: cacheCreation,
+						CacheReadInputTokens:     cacheRead,
+					}
+					if err := store.AddRecord(virtualKey, rec); err != nil {
+						log.Error().Err(err).Msg("failed to record usage")
+					}
+					cost := calcModelCost(model, inputTokens, outputTokens, cacheCreation, cacheRead)
 					log.Info().
-						Str("key", maskToken(virtualKey)).
+						Str("key", resolvedName).
+						Str("method", resp.Request.Method).
+						Str("path", resp.Request.URL.Path).
+						Dur("duration", time.Since(reqStart)).
 						Str("model", model).
 						Int64("input_tokens", inputTokens).
 						Int64("output_tokens", outputTokens).
 						Int64("cache_creation", cacheCreation).
 						Int64("cache_read", cacheRead).
-						Msg("usage recorded")
+						Float64("cost_usd", math.Round(cost*1000000)/1000000).
+						Msg("completed")
 				}
 
 				resp.Body = io.NopCloser(bytes.NewReader(body))
@@ -924,6 +981,7 @@ func main() {
 				CacheReadInputTokens     int64                     `json:"cache_read_input_tokens"`
 				ByModel                  map[string]modelUsageJSON `json:"by_model"`
 				BudgetLimitUSD           float64                   `json:"budget_limit_usd"`
+				LastActive               *time.Time                `json:"last_active,omitempty"`
 			}
 			keys := keyMgr.List()
 			allUsage, err := store.QueryAll(since)
@@ -944,7 +1002,7 @@ func main() {
 						CacheReadInputTokens:     mu.CacheReadInputTokens,
 					}
 				}
-				result = append(result, keyWithUsage{
+				entry := keyWithUsage{
 					Name:                     k.Name,
 					Key:                      k.Key,
 					MaskedKey:                maskToken(k.Key),
@@ -955,7 +1013,12 @@ func main() {
 					CacheReadInputTokens:     u.CacheReadInputTokens,
 					ByModel:                  bm,
 					BudgetLimitUSD:           k.BudgetLimitUSD,
-				})
+				}
+				if !u.LastActive.IsZero() {
+					t := u.LastActive
+					entry.LastActive = &t
+				}
+				result = append(result, entry)
 			}
 			writeJSON(w, http.StatusOK, result)
 			return
@@ -1088,11 +1151,66 @@ func main() {
 			return
 		}
 
+		// --- Balance API (for cc-switch etc.) ---
+		if r.URL.Path == "/user/balance" && r.Method == http.MethodGet {
+			var vk string
+			if auth := r.Header.Get("Authorization"); strings.HasPrefix(auth, "Bearer ") {
+				vk = strings.TrimPrefix(auth, "Bearer ")
+			}
+			if !keyMgr.IsValid(vk) {
+				writeJSON(w, http.StatusOK, map[string]any{
+					"is_active":      false,
+					"invalidMessage": "invalid virtual key",
+				})
+				return
+			}
+			budget := keyMgr.GetBudget(vk)
+			cost, _ := store.QueryKeyCost(vk)
+
+			resp := map[string]any{
+				"is_active": true,
+				"used":      math.Round(cost*10000) / 10000,
+				"unit":      "USD",
+			}
+
+			// Find key name for planName.
+			for _, k := range keyMgr.List() {
+				if k.Key == vk {
+					resp["planName"] = k.Name
+					break
+				}
+			}
+
+			if budget > 0 {
+				remaining := budget - cost
+				if remaining < 0 {
+					remaining = 0
+				}
+				resp["total"] = budget
+				resp["remaining"] = math.Round(remaining*10000) / 10000
+				if cost >= budget {
+					resp["is_active"] = false
+					resp["invalidMessage"] = "budget limit exceeded"
+				}
+			} else {
+				resp["remaining"] = -1
+				resp["extra"] = "unlimited budget"
+			}
+			writeJSON(w, http.StatusOK, resp)
+			return
+		}
+
 		// --- Proxy routes ---
 
 		// Health check: respond to HEAD / without auth.
 		if r.Method == http.MethodHead && r.URL.Path == "/" {
 			w.WriteHeader(http.StatusOK)
+			return
+		}
+
+		// Ignore common browser noise that should not require a virtual key.
+		if r.URL.Path == "/favicon.ico" {
+			http.NotFound(w, r)
 			return
 		}
 
@@ -1129,11 +1247,6 @@ func main() {
 			}
 		}
 
-		log.Info().
-			Str("method", r.Method).
-			Str("path", r.URL.Path).
-			Msg("forwarding")
-
 		for name, values := range r.Header {
 			for _, v := range values {
 				if strings.EqualFold(name, "Authorization") {
@@ -1146,13 +1259,9 @@ func main() {
 
 		r.Header.Set("X-Maxmux-Virtual-Key", virtualKey)
 
-		proxy.ServeHTTP(w, r)
-
-		log.Info().
-			Str("method", r.Method).
-			Str("path", r.URL.Path).
-			Dur("duration", time.Since(start)).
-			Msg("completed")
+		// Inject start time into context so ModifyResponse can compute duration.
+		ctx := context.WithValue(r.Context(), ctxStartKey{}, start)
+		proxy.ServeHTTP(w, r.WithContext(ctx))
 	})
 
 	addr := fmt.Sprintf(":%d", cfg.Port)
@@ -1335,6 +1444,7 @@ const adminHTML = `<!DOCTYPE html>
             <th>Cache Read</th>
             <th>Est. Cost</th>
             <th>Budget</th>
+            <th>Last Active</th>
             <th></th>
           </tr>
         </thead>
@@ -1440,6 +1550,16 @@ function formatNumber(n) {
   return n.toLocaleString();
 }
 
+function formatRelTime(iso) {
+  if (!iso) return '—';
+  const d = new Date(iso);
+  const diff = Math.floor((Date.now() - d.getTime()) / 1000);
+  if (diff < 60) return diff + 's ago';
+  if (diff < 3600) return Math.floor(diff / 60) + 'm ago';
+  if (diff < 86400) return Math.floor(diff / 3600) + 'h ago';
+  return Math.floor(diff / 86400) + 'd ago';
+}
+
 function setTimeRange(el) {
   document.querySelectorAll('.time-filter button').forEach(b => b.classList.remove('active'));
   el.classList.add('active');
@@ -1490,13 +1610,18 @@ function showDashboard() {
 
 async function loadKeys() {
   const url = currentSince > 0 ? API + '/keys?since=' + currentSince : API + '/keys';
-  const res = await fetch(url);
+  let res;
+  try { res = await fetch(url); } catch(e) { return; }
   if (!res.ok) {
     if (res.status === 401) {
-      // Confirm session is truly invalid before logging out.
-      const check = await fetch(API + '/session');
-      if (!check.ok) logout();
+      // Only logout if the session is definitively invalid (not a transient error).
+      try {
+        const check = await fetch(API + '/session');
+        if (check.status === 401) logout();
+        // Any other status (5xx, network error) = keep the session alive.
+      } catch(e) { /* network error, don't logout */ }
     }
+    // Non-401 errors (5xx, etc.) are transient — don't logout.
     return;
   }
   const keys = await res.json();
@@ -1539,6 +1664,7 @@ async function loadKeys() {
       budgetCell = '<td class="token-num"><a href="#" style="font-size:12px;color:#9ca3af" onclick="event.preventDefault();setBudget(\'' + escAttr(k.key) + '\',0)">set limit</a></td>';
     }
 
+    const lastActiveStr = k.last_active ? formatRelTime(k.last_active) : '<span style="color:#9ca3af">—</span>';
     html += '<tr>' +
       '<td><strong>' + escHtml(k.name) + '</strong></td>' +
       '<td class="mono" style="white-space:nowrap">' + escHtml(k.masked_key) + ' <a href="#" style="font-size:11px;color:#6b7280;text-decoration:none" onclick="event.preventDefault();copyKey(\'' + escAttr(k.key) + '\',this)">copy</a></td>' +
@@ -1549,11 +1675,12 @@ async function loadKeys() {
       '<td class="token-num">' + formatNumber(k.cache_read_input_tokens || 0) + '</td>' +
       '<td class="cost-cell token-num">' + formatCost(keyCost) + '</td>' +
       budgetCell +
+      '<td style="white-space:nowrap;font-size:12px;color:#6b7280">' + lastActiveStr + '</td>' +
       '<td><button class="btn btn-danger btn-sm" onclick="removeKey(\'' + escAttr(k.key) + '\',\'' + escAttr(k.name) + '\')">Delete</button></td>' +
       '</tr>';
   }
   if (keys.length === 0) {
-    html = '<tr><td colspan="10" style="text-align:center;color:#9ca3af;padding:32px">No virtual keys configured</td></tr>';
+    html = '<tr><td colspan="11" style="text-align:center;color:#9ca3af;padding:32px">No virtual keys configured</td></tr>';
   }
   tbody.innerHTML = html;
 
