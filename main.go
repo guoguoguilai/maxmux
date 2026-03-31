@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"crypto/rand"
+	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"flag"
@@ -19,13 +20,15 @@ import (
 	"time"
 
 	"github.com/rs/zerolog"
+	_ "modernc.org/sqlite"
 	"gopkg.in/yaml.v3"
 )
 
 // VirtualKeyConfig represents a virtual key with a human-readable name.
 type VirtualKeyConfig struct {
-	Name string `yaml:"name" json:"name"`
-	Key  string `yaml:"key" json:"key"`
+	Name           string  `yaml:"name" json:"name"`
+	Key            string  `yaml:"key" json:"key"`
+	BudgetLimitUSD float64 `yaml:"budget_limit_usd,omitempty" json:"budget_limit_usd"`
 }
 
 type AdminConfig struct {
@@ -34,11 +37,11 @@ type AdminConfig struct {
 }
 
 type Config struct {
-	Port        int                `yaml:"port"`
-	Upstream    string             `yaml:"upstream"`
-	OAuthToken  string             `yaml:"oauth_token"`
-	Admin       AdminConfig        `yaml:"admin"`
-	VirtualKeys []VirtualKeyConfig `yaml:"virtual_keys"`
+	Port       int             `yaml:"port"`
+	Upstream   string          `yaml:"upstream"`
+	OAuthToken string          `yaml:"oauth_token"`
+	Admin      AdminConfig     `yaml:"admin"`
+	SeedKeys   []VirtualKeyConfig `yaml:"virtual_keys"`
 }
 
 // UsageRecord stores a single request's usage data with timestamp.
@@ -49,24 +52,6 @@ type UsageRecord struct {
 	OutputTokens             int64     `json:"output_tokens"`
 	CacheCreationInputTokens int64     `json:"cache_creation_input_tokens"`
 	CacheReadInputTokens     int64     `json:"cache_read_input_tokens"`
-}
-
-// UsageTracker stores per-key usage records with timestamps.
-type UsageTracker struct {
-	mu      sync.RWMutex
-	records map[string][]UsageRecord // key -> records
-	dirty   bool
-}
-
-func NewUsageTracker() *UsageTracker {
-	return &UsageTracker{records: make(map[string][]UsageRecord)}
-}
-
-func (t *UsageTracker) Add(key string, rec UsageRecord) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	t.records[key] = append(t.records[key], rec)
-	t.dirty = true
 }
 
 // ModelUsage is aggregated usage for a single model.
@@ -87,82 +72,295 @@ type KeyStats struct {
 	ByModel                  map[string]ModelUsage `json:"by_model"`
 }
 
-func (t *UsageTracker) Query(key string, since time.Time) KeyStats {
-	t.mu.RLock()
-	defer t.mu.RUnlock()
-	var s KeyStats
-	s.ByModel = make(map[string]ModelUsage)
-	for _, r := range t.records[key] {
-		if r.Timestamp.Before(since) {
-			continue
+// Store handles all persistent data via SQLite.
+type Store struct {
+	db  *sql.DB
+	log *zerolog.Logger
+}
+
+func NewStore(dbPath string, log *zerolog.Logger) (*Store, error) {
+	if dbPath == "" {
+		dbPath = ":memory:"
+	}
+	db, err := sql.Open("sqlite", dbPath+"?_journal_mode=WAL&_busy_timeout=5000")
+	if err != nil {
+		return nil, fmt.Errorf("opening database: %w", err)
+	}
+	// Limit connections to 1 for SQLite.
+	db.SetMaxOpenConns(1)
+
+	s := &Store{db: db, log: log}
+	if err := s.migrate(); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("migrating database: %w", err)
+	}
+	return s, nil
+}
+
+func (s *Store) migrate() error {
+	_, err := s.db.Exec(`
+		CREATE TABLE IF NOT EXISTS config (
+			key TEXT PRIMARY KEY,
+			value TEXT NOT NULL
+		);
+		CREATE TABLE IF NOT EXISTS virtual_keys (
+			key TEXT PRIMARY KEY,
+			name TEXT NOT NULL,
+			budget_limit_usd REAL NOT NULL DEFAULT 0
+		);
+		CREATE TABLE IF NOT EXISTS usage_records (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			virtual_key TEXT NOT NULL,
+			timestamp DATETIME NOT NULL DEFAULT (datetime('now')),
+			model TEXT NOT NULL DEFAULT '',
+			input_tokens INTEGER NOT NULL DEFAULT 0,
+			output_tokens INTEGER NOT NULL DEFAULT 0,
+			cache_creation_input_tokens INTEGER NOT NULL DEFAULT 0,
+			cache_read_input_tokens INTEGER NOT NULL DEFAULT 0
+		);
+		CREATE INDEX IF NOT EXISTS idx_records_key_ts ON usage_records(virtual_key, timestamp);
+	`)
+	if err != nil {
+		return err
+	}
+	// Migration: add budget_limit_usd column if missing (for existing databases).
+	s.db.Exec("ALTER TABLE virtual_keys ADD COLUMN budget_limit_usd REAL NOT NULL DEFAULT 0")
+	return nil
+}
+
+func (s *Store) Close() error {
+	return s.db.Close()
+}
+
+// --- Config key-value ---
+
+func (s *Store) GetConfig(key string) (string, error) {
+	var val string
+	err := s.db.QueryRow("SELECT value FROM config WHERE key = ?", key).Scan(&val)
+	if err == sql.ErrNoRows {
+		return "", nil
+	}
+	return val, err
+}
+
+func (s *Store) SetConfig(key, value string) error {
+	_, err := s.db.Exec(
+		"INSERT INTO config (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+		key, value,
+	)
+	return err
+}
+
+// --- Virtual keys ---
+
+func (s *Store) ListKeys() ([]VirtualKeyConfig, error) {
+	rows, err := s.db.Query("SELECT key, name, budget_limit_usd FROM virtual_keys ORDER BY name")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var keys []VirtualKeyConfig
+	for rows.Next() {
+		var k VirtualKeyConfig
+		if err := rows.Scan(&k.Key, &k.Name, &k.BudgetLimitUSD); err != nil {
+			return nil, err
 		}
-		s.RequestCount++
-		s.InputTokens += r.InputTokens
-		s.OutputTokens += r.OutputTokens
-		s.CacheCreationInputTokens += r.CacheCreationInputTokens
-		s.CacheReadInputTokens += r.CacheReadInputTokens
-		if r.Model != "" {
-			m := s.ByModel[r.Model]
-			m.InputTokens += r.InputTokens
-			m.OutputTokens += r.OutputTokens
-			m.CacheCreationInputTokens += r.CacheCreationInputTokens
-			m.CacheReadInputTokens += r.CacheReadInputTokens
-			s.ByModel[r.Model] = m
+		keys = append(keys, k)
+	}
+	return keys, rows.Err()
+}
+
+func (s *Store) AddKey(name, key string) error {
+	_, err := s.db.Exec(
+		"INSERT INTO virtual_keys (key, name) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET name = excluded.name",
+		key, name,
+	)
+	return err
+}
+
+func (s *Store) RemoveKey(key string) (bool, error) {
+	res, err := s.db.Exec("DELETE FROM virtual_keys WHERE key = ?", key)
+	if err != nil {
+		return false, err
+	}
+	n, _ := res.RowsAffected()
+	if n > 0 {
+		// Also delete usage records for this key.
+		s.db.Exec("DELETE FROM usage_records WHERE virtual_key = ?", key)
+	}
+	return n > 0, nil
+}
+
+func (s *Store) SetBudget(key string, budgetUSD float64) error {
+	_, err := s.db.Exec("UPDATE virtual_keys SET budget_limit_usd = ? WHERE key = ?", budgetUSD, key)
+	return err
+}
+
+func (s *Store) GetBudget(key string) float64 {
+	var budget float64
+	s.db.QueryRow("SELECT budget_limit_usd FROM virtual_keys WHERE key = ?", key).Scan(&budget)
+	return budget
+}
+
+// QueryKeyCost calculates the total estimated cost for a key (all time).
+func (s *Store) QueryKeyCost(key string) (float64, error) {
+	rows, err := s.db.Query(
+		`SELECT model,
+			SUM(input_tokens), SUM(output_tokens),
+			SUM(cache_creation_input_tokens), SUM(cache_read_input_tokens)
+		 FROM usage_records
+		 WHERE virtual_key = ?
+		 GROUP BY model`, key)
+	if err != nil {
+		return 0, err
+	}
+	defer rows.Close()
+	var totalCost float64
+	for rows.Next() {
+		var model string
+		var inTok, outTok, cw, cr int64
+		if err := rows.Scan(&model, &inTok, &outTok, &cw, &cr); err != nil {
+			return 0, err
+		}
+		totalCost += calcModelCost(model, inTok, outTok, cw, cr)
+	}
+	return totalCost, rows.Err()
+}
+
+func (s *Store) IsValidKey(key string) bool {
+	var n int
+	s.db.QueryRow("SELECT 1 FROM virtual_keys WHERE key = ?", key).Scan(&n)
+	return n == 1
+}
+
+// SeedKeys adds keys from config if they don't already exist in the database.
+func (s *Store) SeedKeys(keys []VirtualKeyConfig) error {
+	for _, k := range keys {
+		_, err := s.db.Exec(
+			"INSERT OR IGNORE INTO virtual_keys (key, name) VALUES (?, ?)",
+			k.Key, k.Name,
+		)
+		if err != nil {
+			return err
 		}
 	}
-	return s
+	return nil
 }
 
-func (t *UsageTracker) QueryAll(since time.Time) map[string]KeyStats {
-	t.mu.RLock()
-	defer t.mu.RUnlock()
-	result := make(map[string]KeyStats, len(t.records))
-	for key, recs := range t.records {
-		var s KeyStats
-		s.ByModel = make(map[string]ModelUsage)
-		for _, r := range recs {
-			if r.Timestamp.Before(since) {
-				continue
-			}
-			s.RequestCount++
-			s.InputTokens += r.InputTokens
-			s.OutputTokens += r.OutputTokens
-			s.CacheCreationInputTokens += r.CacheCreationInputTokens
-			s.CacheReadInputTokens += r.CacheReadInputTokens
-			if r.Model != "" {
-				m := s.ByModel[r.Model]
-				m.InputTokens += r.InputTokens
-				m.OutputTokens += r.OutputTokens
-				m.CacheCreationInputTokens += r.CacheCreationInputTokens
-				m.CacheReadInputTokens += r.CacheReadInputTokens
-				s.ByModel[r.Model] = m
-			}
-		}
-		result[key] = s
+// --- Usage records ---
+
+func (s *Store) AddRecord(virtualKey string, rec UsageRecord) error {
+	_, err := s.db.Exec(
+		`INSERT INTO usage_records (virtual_key, timestamp, model, input_tokens, output_tokens, cache_creation_input_tokens, cache_read_input_tokens)
+		 VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		virtualKey, rec.Timestamp.UTC().Format(time.RFC3339Nano), rec.Model,
+		rec.InputTokens, rec.OutputTokens, rec.CacheCreationInputTokens, rec.CacheReadInputTokens,
+	)
+	return err
+}
+
+func (s *Store) QueryAll(since time.Time) (map[string]KeyStats, error) {
+	sinceStr := ""
+	if !since.IsZero() {
+		sinceStr = since.UTC().Format(time.RFC3339Nano)
 	}
-	return result
+
+	var rows *sql.Rows
+	var err error
+	if sinceStr == "" {
+		rows, err = s.db.Query(
+			`SELECT virtual_key, model,
+				COUNT(*) as cnt,
+				SUM(input_tokens), SUM(output_tokens),
+				SUM(cache_creation_input_tokens), SUM(cache_read_input_tokens)
+			 FROM usage_records
+			 GROUP BY virtual_key, model`)
+	} else {
+		rows, err = s.db.Query(
+			`SELECT virtual_key, model,
+				COUNT(*) as cnt,
+				SUM(input_tokens), SUM(output_tokens),
+				SUM(cache_creation_input_tokens), SUM(cache_read_input_tokens)
+			 FROM usage_records
+			 WHERE timestamp >= ?
+			 GROUP BY virtual_key, model`, sinceStr)
+	}
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	result := make(map[string]KeyStats)
+	for rows.Next() {
+		var vk, model string
+		var cnt, inTok, outTok, cacheCreate, cacheRead int64
+		if err := rows.Scan(&vk, &model, &cnt, &inTok, &outTok, &cacheCreate, &cacheRead); err != nil {
+			return nil, err
+		}
+		ks := result[vk]
+		if ks.ByModel == nil {
+			ks.ByModel = make(map[string]ModelUsage)
+		}
+		ks.RequestCount += cnt
+		ks.InputTokens += inTok
+		ks.OutputTokens += outTok
+		ks.CacheCreationInputTokens += cacheCreate
+		ks.CacheReadInputTokens += cacheRead
+		if model != "" {
+			m := ks.ByModel[model]
+			m.InputTokens += inTok
+			m.OutputTokens += outTok
+			m.CacheCreationInputTokens += cacheCreate
+			m.CacheReadInputTokens += cacheRead
+			ks.ByModel[model] = m
+		}
+		result[vk] = ks
+	}
+	return result, rows.Err()
 }
 
-func (t *UsageTracker) Delete(key string) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	delete(t.records, key)
-	t.dirty = true
+// PurgeOlderThan deletes records older than the given duration.
+func (s *Store) PurgeOlderThan(d time.Duration) (int64, error) {
+	cutoff := time.Now().Add(-d).UTC().Format(time.RFC3339Nano)
+	res, err := s.db.Exec("DELETE FROM usage_records WHERE timestamp < ?", cutoff)
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
 }
 
-// KeyManager manages virtual keys with thread safety.
+type keyInfo struct {
+	name           string
+	budgetLimitUSD float64
+}
+
+// KeyManager provides a fast in-memory cache for key validation.
 type KeyManager struct {
 	mu    sync.RWMutex
-	keys  map[string]string // key -> name
-	dirty bool
+	keys  map[string]keyInfo // key -> info
+	store *Store
 }
 
-func NewKeyManager(keys []VirtualKeyConfig) *KeyManager {
-	m := &KeyManager{keys: make(map[string]string, len(keys))}
-	for _, k := range keys {
-		m.keys[k.Key] = k.Name
+func NewKeyManager(store *Store) (*KeyManager, error) {
+	m := &KeyManager{keys: make(map[string]keyInfo), store: store}
+	if err := m.reload(); err != nil {
+		return nil, err
 	}
-	return m
+	return m, nil
+}
+
+func (m *KeyManager) reload() error {
+	keys, err := m.store.ListKeys()
+	if err != nil {
+		return err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.keys = make(map[string]keyInfo, len(keys))
+	for _, k := range keys {
+		m.keys[k.Key] = keyInfo{name: k.Name, budgetLimitUSD: k.BudgetLimitUSD}
+	}
+	return nil
 }
 
 func (m *KeyManager) IsValid(key string) bool {
@@ -172,170 +370,56 @@ func (m *KeyManager) IsValid(key string) bool {
 	return ok
 }
 
-func (m *KeyManager) Add(name, key string) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.keys[key] = name
-	m.dirty = true
+func (m *KeyManager) GetBudget(key string) float64 {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.keys[key].budgetLimitUSD
 }
 
-func (m *KeyManager) Remove(key string) bool {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if _, ok := m.keys[key]; !ok {
-		return false
+func (m *KeyManager) SetBudget(key string, budget float64) error {
+	if err := m.store.SetBudget(key, budget); err != nil {
+		return err
 	}
-	delete(m.keys, key)
-	m.dirty = true
-	return true
+	m.mu.Lock()
+	if info, ok := m.keys[key]; ok {
+		info.budgetLimitUSD = budget
+		m.keys[key] = info
+	}
+	m.mu.Unlock()
+	return nil
+}
+
+func (m *KeyManager) Add(name, key string) error {
+	if err := m.store.AddKey(name, key); err != nil {
+		return err
+	}
+	m.mu.Lock()
+	m.keys[key] = keyInfo{name: name}
+	m.mu.Unlock()
+	return nil
+}
+
+func (m *KeyManager) Remove(key string) (bool, error) {
+	ok, err := m.store.RemoveKey(key)
+	if err != nil {
+		return false, err
+	}
+	if ok {
+		m.mu.Lock()
+		delete(m.keys, key)
+		m.mu.Unlock()
+	}
+	return ok, nil
 }
 
 func (m *KeyManager) List() []VirtualKeyConfig {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	result := make([]VirtualKeyConfig, 0, len(m.keys))
-	for k, name := range m.keys {
-		result = append(result, VirtualKeyConfig{Name: name, Key: k})
+	for k, info := range m.keys {
+		result = append(result, VirtualKeyConfig{Name: info.name, Key: k, BudgetLimitUSD: info.budgetLimitUSD})
 	}
 	return result
-}
-
-// StoreData is the on-disk persistence format.
-type StoreData struct {
-	OAuthToken string                      `json:"oauth_token,omitempty"`
-	Keys       []VirtualKeyConfig          `json:"keys"`
-	Records    map[string][]UsageRecord    `json:"records"`
-}
-
-// Store handles loading and saving persistent data.
-type Store struct {
-	path       string
-	keyMgr     *KeyManager
-	tracker    *UsageTracker
-	oauthToken *atomic.Value
-	log        *zerolog.Logger
-}
-
-func NewStore(path string, keyMgr *KeyManager, tracker *UsageTracker, oauthToken *atomic.Value, log *zerolog.Logger) *Store {
-	return &Store{path: path, keyMgr: keyMgr, tracker: tracker, oauthToken: oauthToken, log: log}
-}
-
-func (s *Store) Load() error {
-	if s.path == "" {
-		return nil
-	}
-	data, err := os.ReadFile(s.path)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil
-		}
-		return fmt.Errorf("reading store: %w", err)
-	}
-	var sd StoreData
-	if err := json.Unmarshal(data, &sd); err != nil {
-		return fmt.Errorf("parsing store: %w", err)
-	}
-	// Restore oauth token if saved.
-	if sd.OAuthToken != "" {
-		s.oauthToken.Store(sd.OAuthToken)
-	}
-
-	// Merge keys from disk (disk keys supplement config keys, not replace).
-	s.keyMgr.mu.Lock()
-	for _, k := range sd.Keys {
-		if _, exists := s.keyMgr.keys[k.Key]; !exists {
-			s.keyMgr.keys[k.Key] = k.Name
-		}
-	}
-	s.keyMgr.dirty = false
-	s.keyMgr.mu.Unlock()
-
-	// Load records.
-	s.tracker.mu.Lock()
-	s.tracker.records = sd.Records
-	if s.tracker.records == nil {
-		s.tracker.records = make(map[string][]UsageRecord)
-	}
-	s.tracker.dirty = false
-	s.tracker.mu.Unlock()
-
-	s.log.Info().Str("path", s.path).Int("keys", len(sd.Keys)).Msg("loaded store")
-	return nil
-}
-
-func (s *Store) Save() error {
-	return s.save(false)
-}
-
-func (s *Store) SaveForce() error {
-	return s.save(true)
-}
-
-func (s *Store) save(force bool) error {
-	if s.path == "" {
-		return nil
-	}
-	if !force {
-		// Check if anything changed.
-		s.keyMgr.mu.RLock()
-		keysDirty := s.keyMgr.dirty
-		s.keyMgr.mu.RUnlock()
-		s.tracker.mu.RLock()
-		recDirty := s.tracker.dirty
-		s.tracker.mu.RUnlock()
-		if !keysDirty && !recDirty {
-			return nil
-		}
-	}
-
-	// Snapshot data under locks.
-	s.keyMgr.mu.Lock()
-	keys := make([]VirtualKeyConfig, 0, len(s.keyMgr.keys))
-	for k, name := range s.keyMgr.keys {
-		keys = append(keys, VirtualKeyConfig{Name: name, Key: k})
-	}
-	s.keyMgr.dirty = false
-	s.keyMgr.mu.Unlock()
-
-	s.tracker.mu.Lock()
-	records := make(map[string][]UsageRecord, len(s.tracker.records))
-	for k, v := range s.tracker.records {
-		cp := make([]UsageRecord, len(v))
-		copy(cp, v)
-		records[k] = cp
-	}
-	s.tracker.dirty = false
-	s.tracker.mu.Unlock()
-
-	sd := StoreData{OAuthToken: s.oauthToken.Load().(string), Keys: keys, Records: records}
-	data, err := json.Marshal(sd)
-	if err != nil {
-		return fmt.Errorf("marshaling store: %w", err)
-	}
-	// Atomic write: write to temp file then rename.
-	tmp := s.path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0644); err != nil {
-		return fmt.Errorf("writing store: %w", err)
-	}
-	if err := os.Rename(tmp, s.path); err != nil {
-		return fmt.Errorf("renaming store: %w", err)
-	}
-	return nil
-}
-
-// RunAutoSave periodically saves data to disk.
-func (s *Store) RunAutoSave(interval time.Duration) {
-	if s.path == "" {
-		return
-	}
-	ticker := time.NewTicker(interval)
-	go func() {
-		for range ticker.C {
-			if err := s.Save(); err != nil {
-				s.log.Error().Err(err).Msg("auto-save failed")
-			}
-		}
-	}()
 }
 
 // SessionStore manages admin login sessions.
@@ -398,7 +482,7 @@ func extractFromBody(body []byte) (model string, inputTokens, outputTokens, cach
 type sseUsageReader struct {
 	reader                   io.ReadCloser
 	virtualKey               string
-	tracker                  *UsageTracker
+	store                    *Store
 	log                      *zerolog.Logger
 	buf                      []byte
 	model                    string
@@ -445,9 +529,12 @@ func (r *sseUsageReader) scanBuffer() {
 				Usage *apiUsage `json:"usage"`
 			} `json:"message"`
 		}
-		if err := json.Unmarshal([]byte(data), &event); err != nil {
+		// Use Decoder instead of Unmarshal: stops after valid JSON and ignores
+		// trailing whitespace/garbage that Anthropic sometimes appends.
+		if err := json.NewDecoder(strings.NewReader(data)).Decode(&event); err != nil {
 			continue
 		}
+		r.log.Debug().Str("type", event.Type).Msg("sse event")
 		if event.Type == "message_start" && event.Message != nil {
 			if event.Message.Model != "" {
 				r.model = event.Message.Model
@@ -473,7 +560,9 @@ func (r *sseUsageReader) recordUsage() {
 		CacheCreationInputTokens: r.cacheCreationInputTokens,
 		CacheReadInputTokens:     r.cacheReadInputTokens,
 	}
-	r.tracker.Add(r.virtualKey, rec)
+	if err := r.store.AddRecord(r.virtualKey, rec); err != nil {
+		r.log.Error().Err(err).Msg("failed to record usage")
+	}
 	if r.inputTokens > 0 || r.outputTokens > 0 || r.cacheCreationInputTokens > 0 || r.cacheReadInputTokens > 0 {
 		r.log.Info().
 			Str("key", maskToken(r.virtualKey)).
@@ -517,6 +606,45 @@ func loadConfig(path string) (*Config, error) {
 	return &cfg, nil
 }
 
+// Server-side model pricing ($/M tokens) — mirrors the JS pricing in adminHTML.
+var modelPricing = map[string][2]float64{
+	"claude-opus-4-6":            {15, 75},
+	"claude-opus-4-20250514":     {15, 75},
+	"claude-opus-4-0":            {15, 75},
+	"claude-sonnet-4-6":          {3, 15},
+	"claude-sonnet-4-20250514":   {3, 15},
+	"claude-sonnet-4-0":          {3, 15},
+	"claude-3-5-sonnet-20241022": {3, 15},
+	"claude-3-5-sonnet-20240620": {3, 15},
+	"claude-haiku-4-5-20251001":  {0.8, 4},
+	"claude-3-5-haiku-20241022":  {0.8, 4},
+	"claude-3-opus-20240229":     {15, 75},
+	"claude-3-sonnet-20240229":   {3, 15},
+	"claude-3-haiku-20240307":    {0.25, 1.25},
+}
+
+func getModelPricing(model string) (inputPrice, outputPrice float64) {
+	if p, ok := modelPricing[model]; ok {
+		return p[0], p[1]
+	}
+	// Fuzzy match by prefix.
+	for key, p := range modelPricing {
+		prefix := strings.Split(key, "-2")[0] // e.g. "claude-opus-4" from "claude-opus-4-20250514"
+		if model != "" && strings.HasPrefix(model, prefix) {
+			return p[0], p[1]
+		}
+	}
+	return 3, 15 // default
+}
+
+func calcModelCost(model string, inputTokens, outputTokens, cacheWrite, cacheRead int64) float64 {
+	inp, out := getModelPricing(model)
+	return (float64(inputTokens)*inp +
+		float64(outputTokens)*out +
+		float64(cacheWrite)*inp*1.25 +
+		float64(cacheRead)*inp*0.1) / 1_000_000
+}
+
 func maskToken(t string) string {
 	if len(t) <= 16 {
 		return "***"
@@ -532,8 +660,9 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 
 func main() {
 	configPath := flag.String("config", "config.yaml", "path to config file")
-	dataPath := flag.String("data", "", "path to data file for persistence (e.g. /data/maxmux.json)")
+	dataPath := flag.String("data", "", "path to SQLite database (e.g. /data/maxmux.db)")
 	logLevel := flag.String("log-level", "info", "log level: debug, info, warn, error")
+	retention := flag.Int("retention", 30, "data retention in days (0 = keep forever)")
 	flag.Parse()
 
 	level, err := zerolog.ParseLevel(*logLevel)
@@ -555,18 +684,44 @@ func main() {
 		log.Fatal().Msg("admin username and password are required in config")
 	}
 
-	keyMgr := NewKeyManager(cfg.VirtualKeys)
-	sessions := NewSessionStore()
-	tracker := NewUsageTracker()
-
-	var oauthToken atomic.Value
-	oauthToken.Store(cfg.OAuthToken)
-
-	store := NewStore(*dataPath, keyMgr, tracker, &oauthToken, &log)
-	if err := store.Load(); err != nil {
-		log.Fatal().Err(err).Msg("failed to load store")
+	store, err := NewStore(*dataPath, &log)
+	if err != nil {
+		log.Fatal().Err(err).Msg("failed to open store")
 	}
-	store.RunAutoSave(30 * time.Second)
+	defer store.Close()
+
+	// Seed keys from config (only inserts if not already present).
+	if len(cfg.SeedKeys) > 0 {
+		if err := store.SeedKeys(cfg.SeedKeys); err != nil {
+			log.Fatal().Err(err).Msg("failed to seed keys")
+		}
+	}
+
+	// Purge old records on startup.
+	if *retention > 0 {
+		purged, err := store.PurgeOlderThan(time.Duration(*retention) * 24 * time.Hour)
+		if err != nil {
+			log.Error().Err(err).Msg("failed to purge old records")
+		} else if purged > 0 {
+			log.Info().Int64("purged", purged).Int("retention_days", *retention).Msg("purged old records")
+		}
+	}
+
+	keyMgr, err := NewKeyManager(store)
+	if err != nil {
+		log.Fatal().Err(err).Msg("failed to load keys")
+	}
+	sessions := NewSessionStore()
+
+	// Load or initialize OAuth token.
+	var oauthToken atomic.Value
+	savedToken, _ := store.GetConfig("oauth_token")
+	if savedToken != "" {
+		oauthToken.Store(savedToken)
+	} else {
+		oauthToken.Store(cfg.OAuthToken)
+		store.SetConfig("oauth_token", cfg.OAuthToken)
+	}
 
 	upstream, err := url.Parse(cfg.Upstream)
 	if err != nil {
@@ -575,7 +730,6 @@ func main() {
 	log.Info().
 		Int("port", cfg.Port).
 		Str("upstream", cfg.Upstream).
-		Int("virtual_keys", len(cfg.VirtualKeys)).
 		Str("oauth_token", maskToken(oauthToken.Load().(string))).
 		Msg("starting maxmux")
 
@@ -588,6 +742,8 @@ func main() {
 
 			req.Header.Set("Authorization", "Bearer "+token)
 			req.Header.Del("X-Api-Key")
+			// Prevent gzip so the SSE reader sees plain text bytes.
+			req.Header.Del("Accept-Encoding")
 
 			if existing := req.Header.Get("Anthropic-Beta"); existing != "" {
 				req.Header.Set("Anthropic-Beta", existing+",oauth-2025-04-20")
@@ -616,7 +772,7 @@ func main() {
 				resp.Body = &sseUsageReader{
 					reader:     resp.Body,
 					virtualKey: virtualKey,
-					tracker:    tracker,
+					store:      store,
 					log:        &log,
 				}
 			} else {
@@ -635,7 +791,9 @@ func main() {
 					CacheCreationInputTokens: cacheCreation,
 					CacheReadInputTokens:     cacheRead,
 				}
-				tracker.Add(virtualKey, rec)
+				if err := store.AddRecord(virtualKey, rec); err != nil {
+					log.Error().Err(err).Msg("failed to record usage")
+				}
 				if inputTokens > 0 || outputTokens > 0 || cacheCreation > 0 || cacheRead > 0 {
 					log.Info().
 						Str("key", maskToken(virtualKey)).
@@ -753,9 +911,15 @@ func main() {
 				CacheCreationInputTokens int64                     `json:"cache_creation_input_tokens"`
 				CacheReadInputTokens     int64                     `json:"cache_read_input_tokens"`
 				ByModel                  map[string]modelUsageJSON `json:"by_model"`
+				BudgetLimitUSD           float64                   `json:"budget_limit_usd"`
 			}
 			keys := keyMgr.List()
-			allUsage := tracker.QueryAll(since)
+			allUsage, err := store.QueryAll(since)
+			if err != nil {
+				log.Error().Err(err).Msg("failed to query usage")
+				writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
+				return
+			}
 			result := make([]keyWithUsage, 0, len(keys))
 			for _, k := range keys {
 				u := allUsage[k.Key]
@@ -778,6 +942,7 @@ func main() {
 					CacheCreationInputTokens: u.CacheCreationInputTokens,
 					CacheReadInputTokens:     u.CacheReadInputTokens,
 					ByModel:                  bm,
+					BudgetLimitUSD:           k.BudgetLimitUSD,
 				})
 			}
 			writeJSON(w, http.StatusOK, result)
@@ -800,8 +965,11 @@ func main() {
 				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "name and key are required"})
 				return
 			}
-			keyMgr.Add(req.Name, req.Key)
-			store.Save()
+			if err := keyMgr.Add(req.Name, req.Key); err != nil {
+				log.Error().Err(err).Msg("failed to add key")
+				writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
+				return
+			}
 			log.Info().Str("name", req.Name).Str("key", maskToken(req.Key)).Msg("virtual key added")
 			writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 			return
@@ -818,12 +986,16 @@ func main() {
 				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request"})
 				return
 			}
-			if !keyMgr.Remove(req.Key) {
+			ok, err := keyMgr.Remove(req.Key)
+			if err != nil {
+				log.Error().Err(err).Msg("failed to remove key")
+				writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
+				return
+			}
+			if !ok {
 				writeJSON(w, http.StatusNotFound, map[string]string{"error": "key not found"})
 				return
 			}
-			tracker.Delete(req.Key)
-			store.Save()
 			log.Info().Str("key", maskToken(req.Key)).Msg("virtual key removed")
 			writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 			return
@@ -865,13 +1037,52 @@ func main() {
 				return
 			}
 			oauthToken.Store(req.Token)
-			store.SaveForce()
+			if err := store.SetConfig("oauth_token", req.Token); err != nil {
+				log.Error().Err(err).Msg("failed to save token")
+			}
 			log.Info().Str("token", maskToken(req.Token)).Msg("oauth token updated")
 			writeJSON(w, http.StatusOK, map[string]string{"status": "ok", "masked_token": maskToken(req.Token)})
 			return
 		}
 
+		// Set budget for a key.
+		if r.URL.Path == "/admin/api/budget" && r.Method == http.MethodPut {
+			if !requireAdmin(w, r) {
+				return
+			}
+			var req struct {
+				Key            string  `json:"key"`
+				BudgetLimitUSD float64 `json:"budget_limit_usd"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request"})
+				return
+			}
+			if req.Key == "" {
+				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "key is required"})
+				return
+			}
+			if req.BudgetLimitUSD < 0 {
+				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "budget must be >= 0"})
+				return
+			}
+			if err := keyMgr.SetBudget(req.Key, req.BudgetLimitUSD); err != nil {
+				log.Error().Err(err).Msg("failed to set budget")
+				writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
+				return
+			}
+			log.Info().Str("key", maskToken(req.Key)).Float64("budget", req.BudgetLimitUSD).Msg("budget updated")
+			writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+			return
+		}
+
 		// --- Proxy routes ---
+
+		// Health check: respond to HEAD / without auth.
+		if r.Method == http.MethodHead && r.URL.Path == "/" {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
 
 		start := time.Now()
 
@@ -888,6 +1099,22 @@ func main() {
 				Msg("rejected — invalid virtual key")
 			http.Error(w, `{"error":{"message":"invalid virtual key","type":"authentication_error"}}`, http.StatusUnauthorized)
 			return
+		}
+
+		// Check budget limit.
+		if budget := keyMgr.GetBudget(virtualKey); budget > 0 {
+			cost, err := store.QueryKeyCost(virtualKey)
+			if err != nil {
+				log.Error().Err(err).Msg("failed to query key cost")
+			} else if cost >= budget {
+				log.Warn().
+					Str("key", maskToken(virtualKey)).
+					Float64("cost", cost).
+					Float64("budget", budget).
+					Msg("rejected — budget exceeded")
+				http.Error(w, `{"error":{"message":"budget limit exceeded","type":"rate_limit_error"}}`, http.StatusTooManyRequests)
+				return
+			}
 		}
 
 		log.Info().
@@ -1094,6 +1321,7 @@ const adminHTML = `<!DOCTYPE html>
             <th>Cache Write</th>
             <th>Cache Read</th>
             <th>Est. Cost</th>
+            <th>Budget</th>
             <th></th>
           </tr>
         </thead>
@@ -1143,12 +1371,15 @@ let refreshTimer;
 let currentSince = 0; // 0 = all time, otherwise minutes
 
 const MODEL_PRICING = {
+  'claude-opus-4-6':              { input: 15, output: 75 },
   'claude-opus-4-20250514':       { input: 15, output: 75 },
   'claude-opus-4-0':              { input: 15, output: 75 },
+  'claude-sonnet-4-6':            { input: 3,  output: 15 },
   'claude-sonnet-4-20250514':     { input: 3,  output: 15 },
   'claude-sonnet-4-0':            { input: 3,  output: 15 },
   'claude-3-5-sonnet-20241022':   { input: 3,  output: 15 },
   'claude-3-5-sonnet-20240620':   { input: 3,  output: 15 },
+  'claude-haiku-4-5-20251001':    { input: 0.8, output: 4 },
   'claude-3-5-haiku-20241022':    { input: 0.8, output: 4 },
   'claude-3-opus-20240229':       { input: 15, output: 75 },
   'claude-3-sonnet-20240229':     { input: 3,  output: 15 },
@@ -1276,20 +1507,35 @@ async function loadKeys() {
       modelDetail = '<div class="model-detail">' + parts.join('') + '</div>';
     }
 
+    const budgetLimit = k.budget_limit_usd || 0;
+    let budgetCell;
+    if (budgetLimit > 0) {
+      const pct = Math.min(keyCost / budgetLimit * 100, 100);
+      const color = pct >= 100 ? '#ef4444' : pct >= 80 ? '#f59e0b' : '#059669';
+      budgetCell = '<td class="token-num" style="white-space:nowrap">' +
+        '<div style="font-size:13px;color:' + color + '">' + formatCost(keyCost) + ' / ' + formatCost(budgetLimit) + '</div>' +
+        '<div style="background:#e5e7eb;border-radius:4px;height:4px;margin-top:4px"><div style="background:' + color + ';border-radius:4px;height:4px;width:' + pct.toFixed(1) + '%"></div></div>' +
+        '<a href="#" style="font-size:11px;color:#6b7280" onclick="event.preventDefault();setBudget(\'' + escAttr(k.key) + '\',' + budgetLimit + ')">edit</a>' +
+        '</td>';
+    } else {
+      budgetCell = '<td class="token-num"><a href="#" style="font-size:12px;color:#9ca3af" onclick="event.preventDefault();setBudget(\'' + escAttr(k.key) + '\',0)">set limit</a></td>';
+    }
+
     html += '<tr>' +
       '<td><strong>' + escHtml(k.name) + '</strong></td>' +
-      '<td class="mono">' + escHtml(k.masked_key) + '</td>' +
+      '<td class="mono" style="white-space:nowrap">' + escHtml(k.masked_key) + ' <a href="#" style="font-size:11px;color:#6b7280;text-decoration:none" onclick="event.preventDefault();copyKey(\'' + escAttr(k.key) + '\',this)">copy</a></td>' +
       '<td class="token-num">' + formatNumber(k.request_count) + '</td>' +
       '<td class="token-num">' + formatNumber(k.input_tokens) + modelDetail + '</td>' +
       '<td class="token-num">' + formatNumber(k.output_tokens) + '</td>' +
       '<td class="token-num">' + formatNumber(k.cache_creation_input_tokens || 0) + '</td>' +
       '<td class="token-num">' + formatNumber(k.cache_read_input_tokens || 0) + '</td>' +
       '<td class="cost-cell token-num">' + formatCost(keyCost) + '</td>' +
+      budgetCell +
       '<td><button class="btn btn-danger btn-sm" onclick="removeKey(\'' + escAttr(k.key) + '\',\'' + escAttr(k.name) + '\')">Delete</button></td>' +
       '</tr>';
   }
   if (keys.length === 0) {
-    html = '<tr><td colspan="9" style="text-align:center;color:#9ca3af;padding:32px">No virtual keys configured</td></tr>';
+    html = '<tr><td colspan="10" style="text-align:center;color:#9ca3af;padding:32px">No virtual keys configured</td></tr>';
   }
   tbody.innerHTML = html;
 
@@ -1385,6 +1631,30 @@ async function updateToken() {
     document.getElementById('tokenInput').type = 'password';
     document.getElementById('tokenInput').nextElementSibling.textContent = 'Show';
   }
+}
+
+async function copyKey(key, el) {
+  try {
+    await navigator.clipboard.writeText(key);
+    const orig = el.textContent;
+    el.textContent = 'copied!';
+    setTimeout(() => el.textContent = orig, 1500);
+  } catch(e) {
+    prompt('Copy this key:', key);
+  }
+}
+
+async function setBudget(key, current) {
+  const val = prompt('Set budget limit in USD (0 = unlimited):', current || '');
+  if (val === null) return;
+  const budget = parseFloat(val);
+  if (isNaN(budget) || budget < 0) { alert('Invalid amount'); return; }
+  await fetch(API + '/budget', {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ key, budget_limit_usd: budget })
+  });
+  loadKeys();
 }
 
 checkSession();

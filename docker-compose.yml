@@ -1,11 +1,10 @@
 services:
   maxmux:
     build: .
-    container_name: maxmux
     restart: unless-stopped
     ports:
-      - "4000:4000"
+      - "${PORT:-4000}:4000"
     volumes:
       - ./config.yaml:/config.yaml:ro
       - ./data:/data
-    command: ["-config", "/config.yaml", "-data", "/data/maxmux.json"]
+    command: ["-config", "/config.yaml", "-data", "/data/maxmux-${PORT:-4000}.db"]

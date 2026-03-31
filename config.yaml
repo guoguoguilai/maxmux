@@ -5,9 +5,3 @@ oauth_token: sk-ant-oat01-YOUR-TOKEN-HERE
 admin:
   username: admin
   password: pageguo
-
-virtual_keys:
-  - name: Alice
-    key: sk-proxy-key-1
-  - name: Bob
-    key: sk-proxy-key-2
