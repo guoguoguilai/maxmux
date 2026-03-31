@@ -1,6 +1,6 @@
 services:
   maxmux:
-    build: .
+    image: pageguo/maxmux:latest
     restart: unless-stopped
     ports:
       - "${PORT:-4000}:4000"
