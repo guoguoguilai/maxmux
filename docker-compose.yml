@@ -7,4 +7,4 @@ services:
     volumes:
       - ./config.yaml:/config.yaml:ro
       - ./data:/data
-    command: ["-config", "/config.yaml", "-data", "/data/maxmux-${PORT:-4000}.db"]
+    command: ["-config", "/config.yaml", "-data", "/data/${COMPOSE_PROJECT_NAME:-maxmux}.db"]

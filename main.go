@@ -119,6 +119,10 @@ func (s *Store) migrate() error {
 			cache_read_input_tokens INTEGER NOT NULL DEFAULT 0
 		);
 		CREATE INDEX IF NOT EXISTS idx_records_key_ts ON usage_records(virtual_key, timestamp);
+		CREATE TABLE IF NOT EXISTS sessions (
+			token  TEXT PRIMARY KEY,
+			expiry TEXT NOT NULL
+		);
 	`)
 	if err != nil {
 		return err
@@ -422,37 +426,45 @@ func (m *KeyManager) List() []VirtualKeyConfig {
 	return result
 }
 
-// SessionStore manages admin login sessions.
+// SessionStore manages admin login sessions via SQLite.
 type SessionStore struct {
-	mu       sync.RWMutex
-	sessions map[string]time.Time
+	store *Store
 }
 
-func NewSessionStore() *SessionStore {
-	return &SessionStore{sessions: make(map[string]time.Time)}
+func NewSessionStore(store *Store) *SessionStore {
+	// Clean up expired sessions on startup.
+	store.db.Exec("DELETE FROM sessions WHERE expiry < ?", time.Now().UTC().Format(time.RFC3339))
+	return &SessionStore{store: store}
 }
 
 func (s *SessionStore) Create() string {
 	b := make([]byte, 32)
 	rand.Read(b)
 	token := hex.EncodeToString(b)
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.sessions[token] = time.Now().Add(24 * time.Hour)
+	expiry := time.Now().Add(24 * time.Hour).UTC().Format(time.RFC3339)
+	s.store.db.Exec("INSERT INTO sessions (token, expiry) VALUES (?, ?)", token, expiry)
 	return token
 }
 
 func (s *SessionStore) Valid(token string) bool {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	expiry, ok := s.sessions[token]
-	return ok && time.Now().Before(expiry)
+	var expiry string
+	err := s.store.db.QueryRow("SELECT expiry FROM sessions WHERE token = ?", token).Scan(&expiry)
+	if err != nil {
+		return false
+	}
+	t, err := time.Parse(time.RFC3339, expiry)
+	if err != nil {
+		return false
+	}
+	if time.Now().After(t) {
+		s.store.db.Exec("DELETE FROM sessions WHERE token = ?", token)
+		return false
+	}
+	return true
 }
 
 func (s *SessionStore) Delete(token string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	delete(s.sessions, token)
+	s.store.db.Exec("DELETE FROM sessions WHERE token = ?", token)
 }
 
 // apiUsage represents the usage field in Anthropic API responses.
@@ -711,7 +723,7 @@ func main() {
 	if err != nil {
 		log.Fatal().Err(err).Msg("failed to load keys")
 	}
-	sessions := NewSessionStore()
+	sessions := NewSessionStore(store)
 
 	// Load or initialize OAuth token.
 	var oauthToken atomic.Value
@@ -1308,6 +1320,7 @@ const adminHTML = `<!DOCTYPE html>
     <div class="section">
       <div class="section-header">
         <h2>Virtual Keys</h2>
+        <label class="btn btn-secondary btn-sm" style="cursor:pointer;margin-right:6px">Import CSV<input type="file" accept=".csv,.txt" style="display:none" onchange="importCSV(this)"></label>
         <button class="btn btn-primary btn-sm" onclick="showAddModal()">+ Add Key</button>
       </div>
       <table>
@@ -1635,6 +1648,28 @@ async function updateToken() {
     document.getElementById('tokenInput').type = 'password';
     document.getElementById('tokenInput').nextElementSibling.textContent = 'Show';
   }
+}
+
+async function importCSV(input) {
+  const file = input.files[0];
+  if (!file) return;
+  const text = await file.text();
+  const lines = text.trim().split('\n').filter(l => l.trim() && !l.startsWith('#'));
+  let added = 0, errors = 0;
+  for (const line of lines) {
+    const parts = line.split(',').map(s => s.trim());
+    if (parts.length < 2 || !parts[0] || !parts[1]) { errors++; continue; }
+    const [name, key] = parts;
+    const res = await fetch(API + '/keys', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name, key })
+    });
+    if (res.ok) added++; else errors++;
+  }
+  input.value = '';
+  alert('Imported ' + added + ' key(s)' + (errors > 0 ? ', ' + errors + ' failed' : ''));
+  loadKeys();
 }
 
 async function copyKey(key, el) {
