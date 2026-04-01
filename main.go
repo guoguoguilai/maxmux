@@ -28,9 +28,10 @@ import (
 
 // VirtualKeyConfig represents a virtual key with a human-readable name.
 type VirtualKeyConfig struct {
-	Name           string  `yaml:"name" json:"name"`
-	Key            string  `yaml:"key" json:"key"`
-	BudgetLimitUSD float64 `yaml:"budget_limit_usd,omitempty" json:"budget_limit_usd"`
+	Name            string  `yaml:"name" json:"name"`
+	Key             string  `yaml:"key" json:"key"`
+	BudgetLimitUSD  float64 `yaml:"budget_limit_usd,omitempty" json:"budget_limit_usd"`
+	DailyLimitUSD   float64 `yaml:"daily_limit_usd,omitempty" json:"daily_limit_usd"`
 }
 
 type AdminConfig struct {
@@ -130,8 +131,9 @@ func (s *Store) migrate() error {
 	if err != nil {
 		return err
 	}
-	// Migration: add budget_limit_usd column if missing (for existing databases).
+	// Migration: add columns if missing (for existing databases).
 	s.db.Exec("ALTER TABLE virtual_keys ADD COLUMN budget_limit_usd REAL NOT NULL DEFAULT 0")
+	s.db.Exec("ALTER TABLE virtual_keys ADD COLUMN daily_limit_usd REAL NOT NULL DEFAULT 0")
 	return nil
 }
 
@@ -161,7 +163,7 @@ func (s *Store) SetConfig(key, value string) error {
 // --- Virtual keys ---
 
 func (s *Store) ListKeys() ([]VirtualKeyConfig, error) {
-	rows, err := s.db.Query("SELECT key, name, budget_limit_usd FROM virtual_keys ORDER BY name")
+	rows, err := s.db.Query("SELECT key, name, budget_limit_usd, daily_limit_usd FROM virtual_keys ORDER BY name")
 	if err != nil {
 		return nil, err
 	}
@@ -169,7 +171,7 @@ func (s *Store) ListKeys() ([]VirtualKeyConfig, error) {
 	var keys []VirtualKeyConfig
 	for rows.Next() {
 		var k VirtualKeyConfig
-		if err := rows.Scan(&k.Key, &k.Name, &k.BudgetLimitUSD); err != nil {
+		if err := rows.Scan(&k.Key, &k.Name, &k.BudgetLimitUSD, &k.DailyLimitUSD); err != nil {
 			return nil, err
 		}
 		keys = append(keys, k)
@@ -207,6 +209,43 @@ func (s *Store) GetBudget(key string) float64 {
 	var budget float64
 	s.db.QueryRow("SELECT budget_limit_usd FROM virtual_keys WHERE key = ?", key).Scan(&budget)
 	return budget
+}
+
+func (s *Store) SetDailyLimit(key string, dailyUSD float64) error {
+	_, err := s.db.Exec("UPDATE virtual_keys SET daily_limit_usd = ? WHERE key = ?", dailyUSD, key)
+	return err
+}
+
+func (s *Store) GetDailyLimit(key string) float64 {
+	var limit float64
+	s.db.QueryRow("SELECT daily_limit_usd FROM virtual_keys WHERE key = ?", key).Scan(&limit)
+	return limit
+}
+
+// QueryKeyCostToday calculates the estimated cost for a key since midnight UTC today.
+func (s *Store) QueryKeyCostToday(key string) (float64, error) {
+	todayUTC := time.Now().UTC().Truncate(24 * time.Hour).Format(time.RFC3339)
+	rows, err := s.db.Query(
+		`SELECT model,
+			SUM(input_tokens), SUM(output_tokens),
+			SUM(cache_creation_input_tokens), SUM(cache_read_input_tokens)
+		 FROM usage_records
+		 WHERE virtual_key = ? AND timestamp >= ?
+		 GROUP BY model`, key, todayUTC)
+	if err != nil {
+		return 0, err
+	}
+	defer rows.Close()
+	var totalCost float64
+	for rows.Next() {
+		var model string
+		var inTok, outTok, cw, cr int64
+		if err := rows.Scan(&model, &inTok, &outTok, &cw, &cr); err != nil {
+			return 0, err
+		}
+		totalCost += calcModelCost(model, inTok, outTok, cw, cr)
+	}
+	return totalCost, rows.Err()
 }
 
 // QueryKeyCost calculates the total estimated cost for a key (all time).
@@ -349,6 +388,7 @@ func (s *Store) PurgeOlderThan(d time.Duration) (int64, error) {
 type keyInfo struct {
 	name           string
 	budgetLimitUSD float64
+	dailyLimitUSD  float64
 }
 
 // KeyManager provides a fast in-memory cache for key validation.
@@ -375,7 +415,7 @@ func (m *KeyManager) reload() error {
 	defer m.mu.Unlock()
 	m.keys = make(map[string]keyInfo, len(keys))
 	for _, k := range keys {
-		m.keys[k.Key] = keyInfo{name: k.Name, budgetLimitUSD: k.BudgetLimitUSD}
+		m.keys[k.Key] = keyInfo{name: k.Name, budgetLimitUSD: k.BudgetLimitUSD, dailyLimitUSD: k.DailyLimitUSD}
 	}
 	return nil
 }
@@ -400,6 +440,25 @@ func (m *KeyManager) SetBudget(key string, budget float64) error {
 	m.mu.Lock()
 	if info, ok := m.keys[key]; ok {
 		info.budgetLimitUSD = budget
+		m.keys[key] = info
+	}
+	m.mu.Unlock()
+	return nil
+}
+
+func (m *KeyManager) GetDailyLimit(key string) float64 {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.keys[key].dailyLimitUSD
+}
+
+func (m *KeyManager) SetDailyLimit(key string, daily float64) error {
+	if err := m.store.SetDailyLimit(key, daily); err != nil {
+		return err
+	}
+	m.mu.Lock()
+	if info, ok := m.keys[key]; ok {
+		info.dailyLimitUSD = daily
 		m.keys[key] = info
 	}
 	m.mu.Unlock()
@@ -434,7 +493,7 @@ func (m *KeyManager) List() []VirtualKeyConfig {
 	defer m.mu.RUnlock()
 	result := make([]VirtualKeyConfig, 0, len(m.keys))
 	for k, info := range m.keys {
-		result = append(result, VirtualKeyConfig{Name: info.name, Key: k, BudgetLimitUSD: info.budgetLimitUSD})
+		result = append(result, VirtualKeyConfig{Name: info.name, Key: k, BudgetLimitUSD: info.budgetLimitUSD, DailyLimitUSD: info.dailyLimitUSD})
 	}
 	return result
 }
@@ -981,6 +1040,8 @@ func main() {
 				CacheReadInputTokens     int64                     `json:"cache_read_input_tokens"`
 				ByModel                  map[string]modelUsageJSON `json:"by_model"`
 				BudgetLimitUSD           float64                   `json:"budget_limit_usd"`
+				DailyLimitUSD            float64                   `json:"daily_limit_usd"`
+				CostTodayUSD             float64                   `json:"cost_today_usd"`
 				LastActive               *time.Time                `json:"last_active,omitempty"`
 			}
 			keys := keyMgr.List()
@@ -1002,6 +1063,7 @@ func main() {
 						CacheReadInputTokens:     mu.CacheReadInputTokens,
 					}
 				}
+				costToday, _ := store.QueryKeyCostToday(k.Key)
 				entry := keyWithUsage{
 					Name:                     k.Name,
 					Key:                      k.Key,
@@ -1013,6 +1075,8 @@ func main() {
 					CacheReadInputTokens:     u.CacheReadInputTokens,
 					ByModel:                  bm,
 					BudgetLimitUSD:           k.BudgetLimitUSD,
+					DailyLimitUSD:            k.DailyLimitUSD,
+					CostTodayUSD:             math.Round(costToday*1000000) / 1000000,
 				}
 				if !u.LastActive.IsZero() {
 					t := u.LastActive
@@ -1128,6 +1192,7 @@ func main() {
 			var req struct {
 				Key            string  `json:"key"`
 				BudgetLimitUSD float64 `json:"budget_limit_usd"`
+				DailyLimitUSD  float64 `json:"daily_limit_usd"`
 			}
 			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request"})
@@ -1137,8 +1202,8 @@ func main() {
 				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "key is required"})
 				return
 			}
-			if req.BudgetLimitUSD < 0 {
-				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "budget must be >= 0"})
+			if req.BudgetLimitUSD < 0 || req.DailyLimitUSD < 0 {
+				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "limits must be >= 0"})
 				return
 			}
 			if err := keyMgr.SetBudget(req.Key, req.BudgetLimitUSD); err != nil {
@@ -1146,7 +1211,12 @@ func main() {
 				writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
 				return
 			}
-			log.Info().Str("key", maskToken(req.Key)).Float64("budget", req.BudgetLimitUSD).Msg("budget updated")
+			if err := keyMgr.SetDailyLimit(req.Key, req.DailyLimitUSD); err != nil {
+				log.Error().Err(err).Msg("failed to set daily limit")
+				writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
+				return
+			}
+			log.Info().Str("key", maskToken(req.Key)).Float64("budget", req.BudgetLimitUSD).Float64("daily", req.DailyLimitUSD).Msg("limits updated")
 			writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 			return
 		}
@@ -1246,6 +1316,20 @@ func main() {
 				return
 			}
 		}
+		if daily := keyMgr.GetDailyLimit(virtualKey); daily > 0 {
+			costToday, err := store.QueryKeyCostToday(virtualKey)
+			if err != nil {
+				log.Error().Err(err).Msg("failed to query daily cost")
+			} else if costToday >= daily {
+				log.Warn().
+					Str("key", maskToken(virtualKey)).
+					Float64("cost_today", costToday).
+					Float64("daily_limit", daily).
+					Msg("rejected — daily limit exceeded")
+				http.Error(w, `{"error":{"message":"daily budget limit exceeded","type":"rate_limit_error"}}`, http.StatusTooManyRequests)
+				return
+			}
+		}
 
 		for name, values := range r.Header {
 			for _, v := range values {
@@ -1277,78 +1361,126 @@ const adminHTML = `<!DOCTYPE html>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Maxmux Admin</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Fira+Code:wght@400;500;600&family=Fira+Sans:wght@300;400;500;600&display=swap" rel="stylesheet">
 <style>
   * { margin: 0; padding: 0; box-sizing: border-box; }
-  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #f0f2f5; color: #1a1a1a; min-height: 100vh; }
+  body { font-family: 'Fira Sans', -apple-system, BlinkMacSystemFont, sans-serif; background: #0d1117; color: #e6edf3; min-height: 100vh; font-size: 14px; }
 
-  .login-container { display: flex; justify-content: center; align-items: center; min-height: 100vh; }
-  .login-box { background: #fff; padding: 40px; border-radius: 12px; box-shadow: 0 2px 12px rgba(0,0,0,0.08); width: 360px; }
-  .login-box h1 { font-size: 24px; margin-bottom: 8px; }
-  .login-box p { color: #666; margin-bottom: 24px; font-size: 14px; }
+  /* ── Login ── */
+  .login-container { display: flex; justify-content: center; align-items: center; min-height: 100vh; background: #0d1117; }
+  .login-box { background: #161b22; border: 1px solid #30363d; padding: 40px; border-radius: 12px; width: 360px; }
+  .login-logo { font-family: 'Fira Code', monospace; font-size: 22px; font-weight: 600; color: #58a6ff; margin-bottom: 6px; letter-spacing: -0.5px; }
+  .login-sub { color: #8b949e; margin-bottom: 28px; font-size: 13px; }
   .form-group { margin-bottom: 16px; }
-  .form-group label { display: block; font-size: 13px; font-weight: 500; margin-bottom: 6px; color: #444; }
-  .form-group input { width: 100%; padding: 10px 12px; border: 1px solid #d9d9d9; border-radius: 8px; font-size: 14px; outline: none; transition: border-color 0.2s; }
-  .form-group input:focus { border-color: #4f46e5; }
-  .btn { padding: 10px 20px; border: none; border-radius: 8px; font-size: 14px; font-weight: 500; cursor: pointer; transition: all 0.2s; }
-  .btn-primary { background: #4f46e5; color: #fff; width: 100%; }
-  .btn-primary:hover { background: #4338ca; }
-  .btn-danger { background: #ef4444; color: #fff; }
-  .btn-danger:hover { background: #dc2626; }
-  .btn-sm { padding: 6px 12px; font-size: 12px; }
-  .error-msg { color: #ef4444; font-size: 13px; margin-top: 12px; display: none; }
+  .form-group label { display: block; font-size: 12px; font-weight: 500; margin-bottom: 6px; color: #8b949e; text-transform: uppercase; letter-spacing: 0.05em; }
+  .form-group input { width: 100%; padding: 9px 12px; background: #0d1117; border: 1px solid #30363d; border-radius: 6px; font-size: 14px; color: #e6edf3; outline: none; transition: border-color 0.15s; font-family: inherit; }
+  .form-group input:focus { border-color: #58a6ff; box-shadow: 0 0 0 3px rgba(88,166,255,0.1); }
+  .btn { padding: 8px 16px; border: none; border-radius: 6px; font-size: 13px; font-weight: 500; cursor: pointer; transition: all 0.15s; font-family: inherit; white-space: nowrap; }
+  .btn-primary { background: #238636; color: #fff; }
+  .btn-primary:hover { background: #2ea043; }
+  .btn-blue { background: #1f6feb; color: #fff; }
+  .btn-blue:hover { background: #388bfd; }
+  .btn-danger { background: #da3633; color: #fff; }
+  .btn-danger:hover { background: #f85149; }
+  .btn-secondary { background: #21262d; color: #c9d1d9; border: 1px solid #30363d; }
+  .btn-secondary:hover { background: #30363d; }
+  .btn-sm { padding: 5px 10px; font-size: 12px; }
+  .btn-login { width: 100%; padding: 10px; font-size: 14px; margin-top: 4px; }
+  .error-msg { color: #f85149; font-size: 12px; margin-top: 10px; display: none; background: rgba(248,81,73,0.1); padding: 8px 12px; border-radius: 6px; border: 1px solid rgba(248,81,73,0.2); }
 
+  /* ── Layout ── */
   .dashboard { display: none; }
-  .header { background: #fff; border-bottom: 1px solid #e5e7eb; padding: 16px 32px; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 12px; }
-  .header h1 { font-size: 20px; }
-  .header-right { display: flex; align-items: center; gap: 12px; }
-  .header .btn { background: #f3f4f6; color: #374151; width: auto; }
-  .header .btn:hover { background: #e5e7eb; }
-  .content { max-width: 1100px; margin: 32px auto; padding: 0 24px; }
+  .header { background: #161b22; border-bottom: 1px solid #21262d; padding: 12px 24px; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 10px; position: sticky; top: 0; z-index: 50; }
+  .header-left { display: flex; align-items: center; gap: 16px; }
+  .header-logo { font-family: 'Fira Code', monospace; font-size: 16px; font-weight: 600; color: #58a6ff; letter-spacing: -0.5px; }
+  .header-right { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .content { max-width: 1280px; margin: 24px auto; padding: 0 24px; }
 
-  .time-filter { display: flex; gap: 6px; flex-wrap: wrap; }
-  .time-filter button { padding: 5px 12px; border: 1px solid #d1d5db; border-radius: 6px; background: #fff; font-size: 13px; cursor: pointer; color: #374151; transition: all 0.15s; }
-  .time-filter button:hover { background: #f3f4f6; }
-  .time-filter button.active { background: #4f46e5; color: #fff; border-color: #4f46e5; }
+  /* ── Time filter ── */
+  .time-filter { display: flex; gap: 4px; align-items: center; flex-wrap: wrap; }
+  .time-filter button { padding: 4px 10px; border: 1px solid #30363d; border-radius: 6px; background: transparent; font-size: 12px; cursor: pointer; color: #8b949e; transition: all 0.15s; font-family: 'Fira Code', monospace; }
+  .time-filter button:hover { background: #21262d; color: #e6edf3; border-color: #58a6ff; }
+  .time-filter button.active { background: #1f6feb; color: #fff; border-color: #1f6feb; }
+  .custom-range { display: flex; align-items: center; gap: 4px; }
+  .custom-range input { width: 64px; padding: 4px 8px; background: #0d1117; border: 1px solid #30363d; border-radius: 6px; font-size: 12px; color: #e6edf3; font-family: 'Fira Code', monospace; outline: none; }
+  .custom-range input:focus { border-color: #58a6ff; }
+  .custom-range span { font-size: 12px; color: #8b949e; }
 
-  .stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 16px; margin-bottom: 32px; }
-  .stat-card { background: #fff; padding: 20px; border-radius: 12px; box-shadow: 0 1px 3px rgba(0,0,0,0.06); }
-  .stat-card .label { font-size: 13px; color: #6b7280; margin-bottom: 4px; }
-  .stat-card .value { font-size: 28px; font-weight: 600; }
-  .stat-card .value.cost { color: #059669; }
+  /* ── Stats ── */
+  .stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin-bottom: 16px; }
+  .stat-card { background: #161b22; border: 1px solid #21262d; padding: 16px 20px; border-radius: 8px; }
+  .stat-card .label { font-size: 11px; color: #8b949e; margin-bottom: 6px; text-transform: uppercase; letter-spacing: 0.05em; }
+  .stat-card .value { font-size: 24px; font-weight: 600; font-family: 'Fira Code', monospace; color: #e6edf3; }
+  .stat-card .value.cost { color: #3fb950; }
+  .stat-card .value.savings { color: #58a6ff; }
 
-  .section { background: #fff; border-radius: 12px; box-shadow: 0 1px 3px rgba(0,0,0,0.06); padding: 24px; margin-bottom: 24px; }
+  /* ── Section / Table ── */
+  .section { background: #161b22; border: 1px solid #21262d; border-radius: 8px; padding: 20px; margin-bottom: 16px; }
   .section-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; }
-  .section-header h2 { font-size: 16px; }
+  .section-header h2 { font-size: 14px; font-weight: 600; color: #e6edf3; }
+  .section-actions { display: flex; gap: 8px; align-items: center; }
   table { width: 100%; border-collapse: collapse; }
-  th, td { text-align: left; padding: 12px 16px; border-bottom: 1px solid #f3f4f6; font-size: 14px; }
-  th { font-weight: 500; color: #6b7280; font-size: 12px; text-transform: uppercase; letter-spacing: 0.05em; }
+  th { text-align: left; padding: 8px 12px; font-size: 11px; font-weight: 500; color: #8b949e; text-transform: uppercase; letter-spacing: 0.05em; border-bottom: 1px solid #21262d; }
+  td { padding: 12px 12px; border-bottom: 1px solid #161b22; font-size: 13px; vertical-align: middle; }
+  tr:hover td { background: #1c2128; }
   tr:last-child td { border-bottom: none; }
-  .mono { font-family: 'SF Mono', Monaco, Consolas, monospace; font-size: 13px; color: #6b7280; }
-  .cost-cell { color: #059669; font-weight: 500; }
+  .mono { font-family: 'Fira Code', monospace; font-size: 12px; color: #8b949e; }
+  .cost-cell { color: #3fb950; font-weight: 500; font-family: 'Fira Code', monospace; }
+  .name-cell { font-weight: 500; color: #e6edf3; }
+  .model-detail { font-size: 11px; color: #6e7681; margin-top: 3px; }
+  .model-detail span { margin-right: 8px; }
 
-  .model-detail { font-size: 12px; color: #9ca3af; margin-top: 4px; }
-  .model-detail span { margin-right: 12px; }
+  /* ── Budget bar ── */
+  .budget-wrap { min-width: 120px; }
+  .budget-nums { font-size: 12px; font-family: 'Fira Code', monospace; margin-bottom: 4px; display: flex; justify-content: space-between; align-items: baseline; gap: 6px; }
+  .budget-bar-bg { background: #21262d; border-radius: 3px; height: 4px; overflow: hidden; }
+  .budget-bar-fill { height: 4px; border-radius: 3px; transition: width 0.3s; }
+  .budget-label { font-size: 11px; color: #6e7681; margin-top: 3px; }
+  .limit-edit { font-size: 11px; color: #58a6ff; text-decoration: none; cursor: pointer; background: none; border: none; padding: 0; font-family: inherit; }
+  .limit-edit:hover { text-decoration: underline; }
 
-  .modal-overlay { display: none; position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,0.4); z-index: 100; justify-content: center; align-items: center; }
+  /* ── Tag / badge ── */
+  .tag { display: inline-block; padding: 2px 7px; border-radius: 4px; font-size: 11px; font-weight: 500; }
+  .tag-green { background: rgba(63,185,80,0.15); color: #3fb950; }
+  .tag-yellow { background: rgba(210,153,34,0.15); color: #d29922; }
+  .tag-red { background: rgba(248,81,73,0.15); color: #f85149; }
+  .tag-gray { background: rgba(110,118,129,0.15); color: #6e7681; }
+
+  /* ── Modal ── */
+  .modal-overlay { display: none; position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,0.6); z-index: 200; justify-content: center; align-items: center; }
   .modal-overlay.active { display: flex; }
-  .modal { background: #fff; padding: 32px; border-radius: 12px; width: 420px; box-shadow: 0 8px 32px rgba(0,0,0,0.12); }
-  .modal h2 { margin-bottom: 20px; font-size: 18px; }
-  .modal .form-group:last-of-type { margin-bottom: 24px; }
-  .modal-actions { display: flex; gap: 12px; justify-content: flex-end; }
-  .btn-secondary { background: #f3f4f6; color: #374151; }
-  .btn-secondary:hover { background: #e5e7eb; }
+  .modal { background: #161b22; border: 1px solid #30363d; padding: 28px; border-radius: 10px; width: 420px; box-shadow: 0 16px 48px rgba(0,0,0,0.5); }
+  .modal h2 { margin-bottom: 20px; font-size: 16px; color: #e6edf3; }
+  .modal .form-group { margin-bottom: 14px; }
+  .modal .form-group:last-of-type { margin-bottom: 20px; }
+  .modal-actions { display: flex; gap: 8px; justify-content: flex-end; }
+  .modal-hint { font-size: 12px; color: #6e7681; margin-top: 5px; }
+  .input-row { display: flex; gap: 8px; }
+  .input-row input { flex: 1; }
+
+  /* ── Settings ── */
+  .settings-row { display: flex; gap: 8px; align-items: center; }
+  .settings-row input { flex: 1; padding: 8px 12px; background: #0d1117; border: 1px solid #30363d; border-radius: 6px; font-size: 13px; color: #e6edf3; font-family: 'Fira Code', monospace; outline: none; }
+  .settings-row input:focus { border-color: #58a6ff; }
+  .token-current { font-size: 12px; color: #6e7681; margin-top: 6px; }
+  .token-current span { color: #8b949e; font-family: 'Fira Code', monospace; }
+
+  /* ── Toast ── */
+  .toast { position: fixed; bottom: 24px; right: 24px; background: #1f2937; border: 1px solid #374151; color: #e6edf3; padding: 10px 16px; border-radius: 8px; font-size: 13px; z-index: 999; opacity: 0; transform: translateY(8px); transition: all 0.2s; pointer-events: none; }
+  .toast.show { opacity: 1; transform: translateY(0); }
 
   .token-num { font-variant-numeric: tabular-nums; }
 
-  @media (max-width: 768px) {
+  @media (max-width: 900px) {
     .stats { grid-template-columns: repeat(2, 1fr); }
     .content { padding: 0 16px; }
-    .header { padding: 16px; }
-    table { font-size: 13px; }
-    th, td { padding: 8px 10px; }
+    th, td { padding: 8px; font-size: 12px; }
   }
-  @media (max-width: 480px) {
-    .stats { grid-template-columns: 1fr; }
+  @media (max-width: 500px) {
+    .stats { grid-template-columns: 1fr 1fr; }
+    .modal { width: calc(100vw - 32px); }
   }
 </style>
 </head>
@@ -1356,8 +1488,8 @@ const adminHTML = `<!DOCTYPE html>
 
 <div class="login-container" id="loginPage">
   <div class="login-box">
-    <h1>Maxmux</h1>
-    <p>Sign in to the admin dashboard</p>
+    <div class="login-logo">maxmux</div>
+    <div class="login-sub">Admin Dashboard</div>
     <div class="form-group">
       <label>Username</label>
       <input type="text" id="username" autocomplete="username">
@@ -1366,71 +1498,76 @@ const adminHTML = `<!DOCTYPE html>
       <label>Password</label>
       <input type="password" id="password" autocomplete="current-password">
     </div>
-    <button class="btn btn-primary" onclick="login()">Sign In</button>
+    <button class="btn btn-blue btn-login" onclick="login()">Sign In</button>
     <div class="error-msg" id="loginError">Invalid username or password</div>
   </div>
 </div>
 
 <div class="dashboard" id="dashboard">
   <div class="header">
-    <h1>Maxmux Dashboard</h1>
-    <div class="header-right">
+    <div class="header-left">
+      <span class="header-logo">maxmux</span>
       <div class="time-filter" id="timeFilter">
-        <button data-since="1" onclick="setTimeRange(this)">1m</button>
         <button data-since="5" onclick="setTimeRange(this)">5m</button>
-        <button data-since="30" onclick="setTimeRange(this)">30m</button>
         <button data-since="60" onclick="setTimeRange(this)">1h</button>
-        <button data-since="360" onclick="setTimeRange(this)">6h</button>
         <button data-since="1440" onclick="setTimeRange(this)">1d</button>
         <button data-since="10080" onclick="setTimeRange(this)">7d</button>
         <button data-since="43200" onclick="setTimeRange(this)">30d</button>
         <button data-since="0" class="active" onclick="setTimeRange(this)">All</button>
+        <div class="custom-range">
+          <input type="number" id="customMins" placeholder="mins" min="1" onkeydown="if(event.key==='Enter')applyCustomRange()">
+          <button class="btn btn-secondary btn-sm" onclick="applyCustomRange()">Go</button>
+        </div>
       </div>
-      <button class="btn" onclick="logout()">Sign Out</button>
+    </div>
+    <div class="header-right">
+      <button class="btn btn-secondary btn-sm" onclick="logout()">Sign Out</button>
     </div>
   </div>
   <div class="content">
     <div class="stats">
       <div class="stat-card">
-        <div class="label">Total Requests</div>
+        <div class="label">Requests</div>
         <div class="value token-num" id="totalRequests">0</div>
       </div>
       <div class="stat-card">
-        <div class="label">Total Input Tokens</div>
+        <div class="label">Input Tokens</div>
         <div class="value token-num" id="totalInput">0</div>
       </div>
       <div class="stat-card">
-        <div class="label">Total Output Tokens</div>
+        <div class="label">Output Tokens</div>
         <div class="value token-num" id="totalOutput">0</div>
       </div>
       <div class="stat-card">
-        <div class="label">Est. Cost (API Pricing)</div>
+        <div class="label">Est. Cost</div>
         <div class="value cost token-num" id="totalCost">$0.00</div>
       </div>
     </div>
-    <div class="stats" style="margin-top:-16px">
+    <div class="stats">
       <div class="stat-card">
-        <div class="label">Cache Write Tokens</div>
+        <div class="label">Cache Write</div>
         <div class="value token-num" id="totalCacheWrite">0</div>
       </div>
       <div class="stat-card">
-        <div class="label">Cache Read Tokens</div>
+        <div class="label">Cache Read</div>
         <div class="value token-num" id="totalCacheRead">0</div>
       </div>
       <div class="stat-card">
         <div class="label">Cache Hit Rate</div>
-        <div class="value token-num" id="cacheHitRate">-</div>
+        <div class="value token-num" id="cacheHitRate">—</div>
       </div>
       <div class="stat-card">
-        <div class="label">Est. Savings from Cache</div>
-        <div class="value cost token-num" id="cacheSavings">$0.00</div>
+        <div class="label">Cache Savings</div>
+        <div class="value savings token-num" id="cacheSavings">$0.00</div>
       </div>
     </div>
     <div class="section">
       <div class="section-header">
         <h2>Virtual Keys</h2>
-        <label class="btn btn-secondary btn-sm" style="cursor:pointer;margin-right:6px">Import CSV<input type="file" accept=".csv,.txt" style="display:none" onchange="importCSV(this)"></label>
-        <button class="btn btn-primary btn-sm" onclick="showAddModal()">+ Add Key</button>
+        <div class="section-actions">
+          <label class="btn btn-secondary btn-sm" style="cursor:pointer">Import CSV<input type="file" accept=".csv,.txt" style="display:none" onchange="importCSV(this)"></label>
+          <button class="btn btn-blue btn-sm" onclick="showAddModal()">+ Add Key</button>
+        </div>
       </div>
       <table>
         <thead>
@@ -1438,12 +1575,11 @@ const adminHTML = `<!DOCTYPE html>
             <th>Name</th>
             <th>Key</th>
             <th>Requests</th>
-            <th>Input Tokens</th>
-            <th>Output Tokens</th>
-            <th>Cache Write</th>
-            <th>Cache Read</th>
+            <th>Input</th>
+            <th>Output</th>
             <th>Est. Cost</th>
-            <th>Budget</th>
+            <th>Total Budget</th>
+            <th>Daily Budget</th>
             <th>Last Active</th>
             <th></th>
           </tr>
@@ -1452,24 +1588,21 @@ const adminHTML = `<!DOCTYPE html>
       </table>
     </div>
     <div class="section">
-      <div class="section-header">
-        <h2>Settings</h2>
-      </div>
-      <div style="display:flex;gap:12px;align-items:flex-end">
-        <div class="form-group" style="flex:1;margin-bottom:0">
-          <label>OAuth Token</label>
-          <div style="display:flex;gap:8px">
-            <input type="password" id="tokenInput" placeholder="Current token" style="flex:1;padding:10px 12px;border:1px solid #d9d9d9;border-radius:8px;font-size:14px;font-family:monospace">
-            <button class="btn btn-secondary" style="width:auto;white-space:nowrap" onclick="toggleTokenVisibility()">Show</button>
-            <button class="btn btn-primary" style="width:auto;white-space:nowrap" onclick="updateToken()">Save</button>
-          </div>
-          <div style="font-size:12px;color:#9ca3af;margin-top:6px">Current: <span id="currentToken" class="mono">-</span></div>
+      <div class="section-header"><h2>Settings</h2></div>
+      <div class="form-group" style="max-width:480px">
+        <label>OAuth Token</label>
+        <div class="settings-row">
+          <input type="password" id="tokenInput" placeholder="Paste new token">
+          <button class="btn btn-secondary btn-sm" onclick="toggleTokenVisibility()">Show</button>
+          <button class="btn btn-blue btn-sm" onclick="updateToken()">Save</button>
         </div>
+        <div class="token-current">Current: <span id="currentToken">—</span></div>
       </div>
     </div>
   </div>
 </div>
 
+<!-- Add Key Modal -->
 <div class="modal-overlay" id="addModal">
   <div class="modal">
     <h2>Add Virtual Key</h2>
@@ -1479,14 +1612,38 @@ const adminHTML = `<!DOCTYPE html>
     </div>
     <div class="form-group">
       <label>Key</label>
-      <input type="text" id="newKey" placeholder="e.g. sk-proxy-alice-001">
+      <input type="text" id="newKey" placeholder="e.g. sk-ant-...">
     </div>
     <div class="modal-actions">
       <button class="btn btn-secondary" onclick="hideAddModal()">Cancel</button>
-      <button class="btn btn-primary" onclick="addKey()">Add</button>
+      <button class="btn btn-blue" onclick="addKey()">Add Key</button>
     </div>
   </div>
 </div>
+
+<!-- Budget Modal -->
+<div class="modal-overlay" id="budgetModal">
+  <div class="modal">
+    <h2 id="budgetModalTitle">Set Limits</h2>
+    <input type="hidden" id="budgetKey">
+    <div class="form-group">
+      <label>Total Budget (USD)</label>
+      <input type="number" id="budgetTotal" placeholder="0 = unlimited" min="0" step="0.01">
+      <div class="modal-hint">Cumulative all-time spending cap. 0 = no limit.</div>
+    </div>
+    <div class="form-group">
+      <label>Daily Limit (USD)</label>
+      <input type="number" id="budgetDaily" placeholder="0 = unlimited" min="0" step="0.01">
+      <div class="modal-hint">Resets at midnight UTC each day. 0 = no limit.</div>
+    </div>
+    <div class="modal-actions">
+      <button class="btn btn-secondary" onclick="hideBudgetModal()">Cancel</button>
+      <button class="btn btn-blue" onclick="saveBudget()">Save</button>
+    </div>
+  </div>
+</div>
+
+<div class="toast" id="toast"></div>
 
 <script>
 const API = '/admin/api';
@@ -1561,9 +1718,18 @@ function formatRelTime(iso) {
 }
 
 function setTimeRange(el) {
-  document.querySelectorAll('.time-filter button').forEach(b => b.classList.remove('active'));
+  document.querySelectorAll('.time-filter button[data-since]').forEach(b => b.classList.remove('active'));
   el.classList.add('active');
   currentSince = parseInt(el.dataset.since, 10);
+  document.getElementById('customMins').value = '';
+  loadKeys();
+}
+
+function applyCustomRange() {
+  const v = parseInt(document.getElementById('customMins').value, 10);
+  if (!v || v <= 0) return;
+  document.querySelectorAll('.time-filter button[data-since]').forEach(b => b.classList.remove('active'));
+  currentSince = v;
   loadKeys();
 }
 
@@ -1650,37 +1816,53 @@ async function loadKeys() {
       modelDetail = '<div class="model-detail">' + parts.join('') + '</div>';
     }
 
+    // Total budget cell
     const budgetLimit = k.budget_limit_usd || 0;
-    let budgetCell;
+    let totalBudgetCell;
     if (budgetLimit > 0) {
       const pct = Math.min(keyCost / budgetLimit * 100, 100);
-      const color = pct >= 100 ? '#ef4444' : pct >= 80 ? '#f59e0b' : '#059669';
-      budgetCell = '<td class="token-num" style="white-space:nowrap">' +
-        '<div style="font-size:13px;color:' + color + '">' + formatCost(keyCost) + ' / ' + formatCost(budgetLimit) + '</div>' +
-        '<div style="background:#e5e7eb;border-radius:4px;height:4px;margin-top:4px"><div style="background:' + color + ';border-radius:4px;height:4px;width:' + pct.toFixed(1) + '%"></div></div>' +
-        '<a href="#" style="font-size:11px;color:#6b7280" onclick="event.preventDefault();setBudget(\'' + escAttr(k.key) + '\',' + budgetLimit + ')">edit</a>' +
-        '</td>';
+      const barColor = pct >= 100 ? '#f85149' : pct >= 80 ? '#d29922' : '#3fb950';
+      totalBudgetCell = '<td><div class="budget-wrap">' +
+        '<div class="budget-nums"><span style="color:' + barColor + '">' + formatCost(keyCost) + '</span><span style="color:#6e7681">/ ' + formatCost(budgetLimit) + '</span></div>' +
+        '<div class="budget-bar-bg"><div class="budget-bar-fill" style="width:' + pct.toFixed(1) + '%;background:' + barColor + '"></div></div>' +
+        '<button class="limit-edit" onclick="showBudgetModal(\'' + escAttr(k.key) + '\',\'' + escAttr(k.name) + '\',' + budgetLimit + ',' + (k.daily_limit_usd||0) + ')">edit</button>' +
+        '</div></td>';
     } else {
-      budgetCell = '<td class="token-num"><a href="#" style="font-size:12px;color:#9ca3af" onclick="event.preventDefault();setBudget(\'' + escAttr(k.key) + '\',0)">set limit</a></td>';
+      totalBudgetCell = '<td><button class="limit-edit" onclick="showBudgetModal(\'' + escAttr(k.key) + '\',\'' + escAttr(k.name) + '\',0,' + (k.daily_limit_usd||0) + ')">set limit</button></td>';
     }
 
-    const lastActiveStr = k.last_active ? formatRelTime(k.last_active) : '<span style="color:#9ca3af">—</span>';
+    // Daily budget cell
+    const dailyLimit = k.daily_limit_usd || 0;
+    const costToday = k.cost_today_usd || 0;
+    let dailyBudgetCell;
+    if (dailyLimit > 0) {
+      const dpct = Math.min(costToday / dailyLimit * 100, 100);
+      const dcolor = dpct >= 100 ? '#f85149' : dpct >= 80 ? '#d29922' : '#58a6ff';
+      dailyBudgetCell = '<td><div class="budget-wrap">' +
+        '<div class="budget-nums"><span style="color:' + dcolor + '">' + formatCost(costToday) + '</span><span style="color:#6e7681">/ ' + formatCost(dailyLimit) + '</span></div>' +
+        '<div class="budget-bar-bg"><div class="budget-bar-fill" style="width:' + dpct.toFixed(1) + '%;background:' + dcolor + '"></div></div>' +
+        '<button class="limit-edit" onclick="showBudgetModal(\'' + escAttr(k.key) + '\',\'' + escAttr(k.name) + '\',' + budgetLimit + ',' + dailyLimit + ')">edit</button>' +
+        '</div></td>';
+    } else {
+      dailyBudgetCell = '<td><button class="limit-edit" onclick="showBudgetModal(\'' + escAttr(k.key) + '\',\'' + escAttr(k.name) + '\',' + budgetLimit + ',0)">set limit</button></td>';
+    }
+
+    const lastActiveStr = k.last_active ? formatRelTime(k.last_active) : '<span style="color:#6e7681">—</span>';
     html += '<tr>' +
-      '<td><strong>' + escHtml(k.name) + '</strong></td>' +
-      '<td class="mono" style="white-space:nowrap">' + escHtml(k.masked_key) + ' <a href="#" style="font-size:11px;color:#6b7280;text-decoration:none" onclick="event.preventDefault();copyKey(\'' + escAttr(k.key) + '\',this)">copy</a></td>' +
+      '<td class="name-cell">' + escHtml(k.name) + '</td>' +
+      '<td class="mono" style="white-space:nowrap">' + escHtml(k.masked_key) + ' <button class="limit-edit" onclick="copyKey(\'' + escAttr(k.key) + '\',this)">copy</button></td>' +
       '<td class="token-num">' + formatNumber(k.request_count) + '</td>' +
       '<td class="token-num">' + formatNumber(k.input_tokens) + modelDetail + '</td>' +
       '<td class="token-num">' + formatNumber(k.output_tokens) + '</td>' +
-      '<td class="token-num">' + formatNumber(k.cache_creation_input_tokens || 0) + '</td>' +
-      '<td class="token-num">' + formatNumber(k.cache_read_input_tokens || 0) + '</td>' +
       '<td class="cost-cell token-num">' + formatCost(keyCost) + '</td>' +
-      budgetCell +
-      '<td style="white-space:nowrap;font-size:12px;color:#6b7280">' + lastActiveStr + '</td>' +
+      totalBudgetCell +
+      dailyBudgetCell +
+      '<td style="white-space:nowrap;font-size:12px;color:#6e7681">' + lastActiveStr + '</td>' +
       '<td><button class="btn btn-danger btn-sm" onclick="removeKey(\'' + escAttr(k.key) + '\',\'' + escAttr(k.name) + '\')">Delete</button></td>' +
       '</tr>';
   }
   if (keys.length === 0) {
-    html = '<tr><td colspan="11" style="text-align:center;color:#9ca3af;padding:32px">No virtual keys configured</td></tr>';
+    html = '<tr><td colspan="10" style="text-align:center;color:#6e7681;padding:40px">No virtual keys configured</td></tr>';
   }
   tbody.innerHTML = html;
 
@@ -1722,12 +1904,13 @@ async function addKey() {
 }
 
 async function removeKey(key, name) {
-  if (!confirm('Delete key "' + name + '"?')) return;
+  if (!confirm('Delete key "' + name + '"? This will also delete all usage history.')) return;
   await fetch(API + '/keys', {
     method: 'DELETE',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ key })
   });
+  showToast('Key "' + name + '" deleted');
   loadKeys();
 }
 
@@ -1807,22 +1990,60 @@ async function copyKey(key, el) {
     el.textContent = 'copied!';
     setTimeout(() => el.textContent = orig, 1500);
   } catch(e) {
-    prompt('Copy this key:', key);
+    showToast('Copy failed — check clipboard permissions');
   }
 }
 
-async function setBudget(key, current) {
-  const val = prompt('Set budget limit in USD (0 = unlimited):', current || '');
-  if (val === null) return;
-  const budget = parseFloat(val);
-  if (isNaN(budget) || budget < 0) { alert('Invalid amount'); return; }
+function showBudgetModal(key, name, currentTotal, currentDaily) {
+  document.getElementById('budgetKey').value = key;
+  document.getElementById('budgetModalTitle').textContent = 'Limits — ' + name;
+  document.getElementById('budgetTotal').value = currentTotal > 0 ? currentTotal : '';
+  document.getElementById('budgetDaily').value = currentDaily > 0 ? currentDaily : '';
+  document.getElementById('budgetModal').classList.add('active');
+  document.getElementById('budgetTotal').focus();
+}
+
+function hideBudgetModal() {
+  document.getElementById('budgetModal').classList.remove('active');
+}
+
+async function saveBudget() {
+  const key = document.getElementById('budgetKey').value;
+  const totalVal = document.getElementById('budgetTotal').value;
+  const dailyVal = document.getElementById('budgetDaily').value;
+  const budget = totalVal === '' ? 0 : parseFloat(totalVal);
+  const daily = dailyVal === '' ? 0 : parseFloat(dailyVal);
+  if (isNaN(budget) || budget < 0 || isNaN(daily) || daily < 0) {
+    showToast('Invalid amount — must be 0 or positive');
+    return;
+  }
   await fetch(API + '/budget', {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ key, budget_limit_usd: budget })
+    body: JSON.stringify({ key, budget_limit_usd: budget, daily_limit_usd: daily })
   });
+  hideBudgetModal();
+  showToast('Limits saved');
   loadKeys();
 }
+
+let toastTimer;
+function showToast(msg) {
+  const t = document.getElementById('toast');
+  t.textContent = msg;
+  t.classList.add('show');
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => t.classList.remove('show'), 3000);
+}
+
+// Close modals on overlay click
+document.getElementById('addModal').addEventListener('click', e => { if (e.target === e.currentTarget) hideAddModal(); });
+document.getElementById('budgetModal').addEventListener('click', e => { if (e.target === e.currentTarget) hideBudgetModal(); });
+
+// Enter key in budget modal
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape') { hideAddModal(); hideBudgetModal(); }
+});
 
 checkSession();
 </script>
