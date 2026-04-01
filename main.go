@@ -76,6 +76,15 @@ type KeyStats struct {
 	LastActive               time.Time             `json:"last_active,omitempty"`
 }
 
+// StatsBucket is one time-series data point returned by /admin/api/stats.
+type StatsBucket struct {
+	Time         string  `json:"time"`
+	Requests     int64   `json:"requests"`
+	CostUSD      float64 `json:"cost_usd"`
+	InputTokens  int64   `json:"input_tokens"`
+	OutputTokens int64   `json:"output_tokens"`
+}
+
 // Store handles all persistent data via SQLite.
 type Store struct {
 	db  *sql.DB
@@ -305,34 +314,33 @@ func (s *Store) AddRecord(virtualKey string, rec UsageRecord) error {
 	return err
 }
 
-func (s *Store) QueryAll(since time.Time) (map[string]KeyStats, error) {
-	sinceStr := ""
-	if !since.IsZero() {
-		sinceStr = since.UTC().Format(time.RFC3339Nano)
+// timeRangeWhere builds a SQL WHERE clause for an optional from/to time range.
+func timeRangeWhere(from, to time.Time) (clause string, args []any) {
+	var parts []string
+	if !from.IsZero() {
+		parts = append(parts, "timestamp >= ?")
+		args = append(args, from.UTC().Format(time.RFC3339Nano))
 	}
+	if !to.IsZero() {
+		parts = append(parts, "timestamp <= ?")
+		args = append(args, to.UTC().Format(time.RFC3339Nano))
+	}
+	if len(parts) > 0 {
+		clause = "WHERE " + strings.Join(parts, " AND ")
+	}
+	return
+}
 
-	var rows *sql.Rows
-	var err error
-	if sinceStr == "" {
-		rows, err = s.db.Query(
-			`SELECT virtual_key, model,
-				COUNT(*) as cnt,
-				SUM(input_tokens), SUM(output_tokens),
-				SUM(cache_creation_input_tokens), SUM(cache_read_input_tokens),
-				MAX(timestamp)
-			 FROM usage_records
-			 GROUP BY virtual_key, model`)
-	} else {
-		rows, err = s.db.Query(
-			`SELECT virtual_key, model,
-				COUNT(*) as cnt,
-				SUM(input_tokens), SUM(output_tokens),
-				SUM(cache_creation_input_tokens), SUM(cache_read_input_tokens),
-				MAX(timestamp)
-			 FROM usage_records
-			 WHERE timestamp >= ?
-			 GROUP BY virtual_key, model`, sinceStr)
-	}
+func (s *Store) QueryAll(from, to time.Time) (map[string]KeyStats, error) {
+	where, args := timeRangeWhere(from, to)
+	q := fmt.Sprintf(`SELECT virtual_key, model,
+		COUNT(*) as cnt,
+		SUM(input_tokens), SUM(output_tokens),
+		SUM(cache_creation_input_tokens), SUM(cache_read_input_tokens),
+		MAX(timestamp)
+	 FROM usage_records %s
+	 GROUP BY virtual_key, model`, where)
+	rows, err := s.db.Query(q, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -373,6 +381,71 @@ func (s *Store) QueryAll(since time.Time) (map[string]KeyStats, error) {
 		result[vk] = ks
 	}
 	return result, rows.Err()
+}
+
+func (s *Store) QueryStats(from, to time.Time, key string) ([]StatsBucket, error) {
+	// Choose bucket granularity based on range duration.
+	var bucketExpr string
+	if !from.IsZero() && !to.IsZero() {
+		d := to.Sub(from)
+		switch {
+		case d < 2*24*time.Hour:
+			bucketExpr = "strftime('%Y-%m-%dT%H:00:00Z', timestamp)"
+		case d < 60*24*time.Hour:
+			bucketExpr = "strftime('%Y-%m-%dT00:00:00Z', timestamp)"
+		default:
+			bucketExpr = "strftime('%Y-%m-%dT00:00:00Z', date(timestamp, 'weekday 0', '-6 days'))"
+		}
+	} else if !from.IsZero() {
+		d := time.Since(from)
+		switch {
+		case d < 2*24*time.Hour:
+			bucketExpr = "strftime('%Y-%m-%dT%H:00:00Z', timestamp)"
+		case d < 60*24*time.Hour:
+			bucketExpr = "strftime('%Y-%m-%dT00:00:00Z', timestamp)"
+		default:
+			bucketExpr = "strftime('%Y-%m-%dT00:00:00Z', date(timestamp, 'weekday 0', '-6 days'))"
+		}
+	} else {
+		// No range specified — default to daily buckets.
+		bucketExpr = "strftime('%Y-%m-%dT00:00:00Z', timestamp)"
+	}
+
+	where, args := timeRangeWhere(from, to)
+	if key != "" {
+		if where == "" {
+			where = "WHERE virtual_key = ?"
+		} else {
+			where += " AND virtual_key = ?"
+		}
+		args = append(args, key)
+	}
+
+	q := fmt.Sprintf(`SELECT %s as bucket,
+		COUNT(*),
+		SUM(input_tokens), SUM(output_tokens),
+		SUM(cache_creation_input_tokens), SUM(cache_read_input_tokens)
+	 FROM usage_records %s
+	 GROUP BY bucket
+	 ORDER BY bucket`, bucketExpr, where)
+
+	rows, err := s.db.Query(q, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var buckets []StatsBucket
+	for rows.Next() {
+		var b StatsBucket
+		var cw, cr int64
+		if err := rows.Scan(&b.Time, &b.Requests, &b.InputTokens, &b.OutputTokens, &cw, &cr); err != nil {
+			return nil, err
+		}
+		b.CostUSD = math.Round(calcModelCost("", b.InputTokens, b.OutputTokens, cw, cr)*1000000) / 1000000
+		buckets = append(buckets, b)
+	}
+	return buckets, rows.Err()
 }
 
 // PurgeOlderThan deletes records older than the given duration.
@@ -699,15 +772,19 @@ func loadConfig(path string) (*Config, error) {
 
 // Server-side model pricing ($/M tokens) — mirrors the JS pricing in adminHTML.
 var modelPricing = map[string][2]float64{
-	"claude-opus-4-6":            {15, 75},
-	"claude-opus-4-20250514":     {15, 75},
-	"claude-opus-4-0":            {15, 75},
+	"claude-opus-4-6":            {5, 25},
+	"claude-opus-4-5":            {5, 25},
+	"claude-opus-4-1":            {5, 25},
+	"claude-opus-4-20250514":     {5, 25},
+	"claude-opus-4-0":            {5, 25},
 	"claude-sonnet-4-6":          {3, 15},
+	"claude-sonnet-4-5":          {3, 15},
 	"claude-sonnet-4-20250514":   {3, 15},
 	"claude-sonnet-4-0":          {3, 15},
+	"claude-3-7-sonnet-20250219": {3, 15},
 	"claude-3-5-sonnet-20241022": {3, 15},
 	"claude-3-5-sonnet-20240620": {3, 15},
-	"claude-haiku-4-5-20251001":  {0.8, 4},
+	"claude-haiku-4-5-20251001":  {1, 5},
 	"claude-3-5-haiku-20241022":  {0.8, 4},
 	"claude-3-opus-20240229":     {15, 75},
 	"claude-3-sonnet-20240229":   {3, 15},
@@ -954,17 +1031,28 @@ func main() {
 		return true
 	}
 
-	// parseSince parses the "since" query param as minutes ago. 0 means all time.
-	parseSince := func(r *http.Request) time.Time {
-		s := r.URL.Query().Get("since")
-		if s == "" {
-			return time.Time{}
+	// parseTimeRange parses from=/to= (ISO8601) or falls back to since=<minutes>.
+	parseTimeRange := func(r *http.Request) (from, to time.Time) {
+		q := r.URL.Query()
+		if fs := q.Get("from"); fs != "" {
+			if t, err := time.Parse(time.RFC3339, fs); err == nil {
+				from = t.UTC()
+			}
 		}
-		mins, err := strconv.ParseInt(s, 10, 64)
-		if err != nil || mins <= 0 {
-			return time.Time{}
+		if ts := q.Get("to"); ts != "" {
+			if t, err := time.Parse(time.RFC3339, ts); err == nil {
+				to = t.UTC()
+			}
 		}
-		return time.Now().Add(-time.Duration(mins) * time.Minute)
+		// Fall back to since= (minutes ago) only if from not set.
+		if from.IsZero() {
+			if s := q.Get("since"); s != "" {
+				if mins, err := strconv.ParseInt(s, 10, 64); err == nil && mins > 0 {
+					from = time.Now().Add(-time.Duration(mins) * time.Minute).UTC()
+				}
+			}
+		}
+		return
 	}
 
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1022,7 +1110,7 @@ func main() {
 			if !requireAdmin(w, r) {
 				return
 			}
-			since := parseSince(r)
+			from, to := parseTimeRange(r)
 			type modelUsageJSON struct {
 				InputTokens              int64 `json:"input_tokens"`
 				OutputTokens             int64 `json:"output_tokens"`
@@ -1039,13 +1127,15 @@ func main() {
 				CacheCreationInputTokens int64                     `json:"cache_creation_input_tokens"`
 				CacheReadInputTokens     int64                     `json:"cache_read_input_tokens"`
 				ByModel                  map[string]modelUsageJSON `json:"by_model"`
+				CostUSD                  float64                   `json:"cost_usd"`
+				CacheSavingsUSD          float64                   `json:"cache_savings_usd"`
 				BudgetLimitUSD           float64                   `json:"budget_limit_usd"`
 				DailyLimitUSD            float64                   `json:"daily_limit_usd"`
 				CostTodayUSD             float64                   `json:"cost_today_usd"`
 				LastActive               *time.Time                `json:"last_active,omitempty"`
 			}
 			keys := keyMgr.List()
-			allUsage, err := store.QueryAll(since)
+			allUsage, err := store.QueryAll(from, to)
 			if err != nil {
 				log.Error().Err(err).Msg("failed to query usage")
 				writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
@@ -1063,6 +1153,18 @@ func main() {
 						CacheReadInputTokens:     mu.CacheReadInputTokens,
 					}
 				}
+				// Compute cost and cache savings server-side.
+				var totalCost, totalSavings float64
+				for model, mu := range u.ByModel {
+					inp, out := getModelPricing(model)
+					totalCost += (float64(mu.InputTokens)*inp +
+						float64(mu.OutputTokens)*out +
+						float64(mu.CacheCreationInputTokens)*inp*1.25 +
+						float64(mu.CacheReadInputTokens)*inp*0.1) / 1_000_000
+					// Savings: cache reads cost 0.1x vs full input price; cache writes cost 1.25x.
+					// Savings from reads = (1 - 0.1) * cacheRead * inp / 1e6
+					totalSavings += float64(mu.CacheReadInputTokens) * inp * 0.9 / 1_000_000
+				}
 				costToday, _ := store.QueryKeyCostToday(k.Key)
 				entry := keyWithUsage{
 					Name:                     k.Name,
@@ -1074,6 +1176,8 @@ func main() {
 					CacheCreationInputTokens: u.CacheCreationInputTokens,
 					CacheReadInputTokens:     u.CacheReadInputTokens,
 					ByModel:                  bm,
+					CostUSD:                  math.Round(totalCost*1000000) / 1000000,
+					CacheSavingsUSD:          math.Round(totalSavings*1000000) / 1000000,
 					BudgetLimitUSD:           k.BudgetLimitUSD,
 					DailyLimitUSD:            k.DailyLimitUSD,
 					CostTodayUSD:             math.Round(costToday*1000000) / 1000000,
@@ -1137,6 +1241,25 @@ func main() {
 			}
 			log.Info().Str("key", maskToken(req.Key)).Msg("virtual key removed")
 			writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+			return
+		}
+
+		if r.URL.Path == "/admin/api/stats" && r.Method == http.MethodGet {
+			if !requireAdmin(w, r) {
+				return
+			}
+			from, to := parseTimeRange(r)
+			key := r.URL.Query().Get("key")
+			buckets, err := store.QueryStats(from, to, key)
+			if err != nil {
+				log.Error().Err(err).Msg("failed to query stats")
+				writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
+				return
+			}
+			if buckets == nil {
+				buckets = []StatsBucket{}
+			}
+			writeJSON(w, http.StatusOK, buckets)
 			return
 		}
 
@@ -1403,10 +1526,22 @@ const adminHTML = `<!DOCTYPE html>
   .time-filter button { padding: 4px 10px; border: 1px solid #30363d; border-radius: 6px; background: transparent; font-size: 12px; cursor: pointer; color: #8b949e; transition: all 0.15s; font-family: 'Fira Code', monospace; }
   .time-filter button:hover { background: #21262d; color: #e6edf3; border-color: #58a6ff; }
   .time-filter button.active { background: #1f6feb; color: #fff; border-color: #1f6feb; }
-  .custom-range { display: flex; align-items: center; gap: 4px; }
-  .custom-range input { width: 64px; padding: 4px 8px; background: #0d1117; border: 1px solid #30363d; border-radius: 6px; font-size: 12px; color: #e6edf3; font-family: 'Fira Code', monospace; outline: none; }
-  .custom-range input:focus { border-color: #58a6ff; }
-  .custom-range span { font-size: 12px; color: #8b949e; }
+  .datetime-range { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; margin-top: 6px; }
+  .datetime-range label { font-size: 11px; color: #8b949e; text-transform: uppercase; letter-spacing: 0.05em; }
+  .datetime-range input[type="datetime-local"] { padding: 4px 8px; background: #0d1117; border: 1px solid #30363d; border-radius: 6px; font-size: 12px; color: #e6edf3; font-family: 'Fira Code', monospace; outline: none; color-scheme: dark; }
+  .datetime-range input[type="datetime-local"]:focus { border-color: #58a6ff; }
+
+  /* ── Charts ── */
+  .charts-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-bottom: 16px; }
+  .chart-card { background: #161b22; border: 1px solid #21262d; border-radius: 8px; padding: 20px; }
+  .chart-card-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; }
+  .chart-card-header h3 { font-size: 13px; font-weight: 600; color: #e6edf3; }
+  .chart-select { padding: 4px 8px; background: #0d1117; border: 1px solid #30363d; border-radius: 6px; font-size: 12px; color: #e6edf3; font-family: inherit; outline: none; cursor: pointer; }
+  .chart-select:focus { border-color: #58a6ff; }
+  .chart-canvas { width: 100%; height: 200px; display: block; }
+  .chart-legend { display: flex; gap: 12px; margin-top: 8px; flex-wrap: wrap; }
+  .legend-item { display: flex; align-items: center; gap: 4px; font-size: 11px; color: #8b949e; }
+  .legend-dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; flex-shrink: 0; }
 
   /* ── Stats ── */
   .stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin-bottom: 16px; }
@@ -1475,6 +1610,7 @@ const adminHTML = `<!DOCTYPE html>
 
   @media (max-width: 900px) {
     .stats { grid-template-columns: repeat(2, 1fr); }
+    .charts-grid { grid-template-columns: 1fr; }
     .content { padding: 0 16px; }
     th, td { padding: 8px; font-size: 12px; }
   }
@@ -1508,16 +1644,18 @@ const adminHTML = `<!DOCTYPE html>
     <div class="header-left">
       <span class="header-logo">maxmux</span>
       <div class="time-filter" id="timeFilter">
-        <button data-since="5" onclick="setTimeRange(this)">5m</button>
-        <button data-since="60" onclick="setTimeRange(this)">1h</button>
-        <button data-since="1440" onclick="setTimeRange(this)">1d</button>
-        <button data-since="10080" onclick="setTimeRange(this)">7d</button>
-        <button data-since="43200" onclick="setTimeRange(this)">30d</button>
-        <button data-since="0" class="active" onclick="setTimeRange(this)">All</button>
-        <div class="custom-range">
-          <input type="number" id="customMins" placeholder="mins" min="1" onkeydown="if(event.key==='Enter')applyCustomRange()">
-          <button class="btn btn-secondary btn-sm" onclick="applyCustomRange()">Go</button>
-        </div>
+        <button data-preset="5m" onclick="setPreset(this)">5m</button>
+        <button data-preset="1h" onclick="setPreset(this)">1h</button>
+        <button data-preset="1d" onclick="setPreset(this)">1d</button>
+        <button data-preset="7d" onclick="setPreset(this)">7d</button>
+        <button data-preset="30d" onclick="setPreset(this)">30d</button>
+        <button data-preset="all" class="active" onclick="setPreset(this)">All</button>
+      </div>
+      <div class="datetime-range">
+        <label>From</label>
+        <input type="datetime-local" id="dtFrom" onchange="applyDateRange()">
+        <label>To</label>
+        <input type="datetime-local" id="dtTo" onchange="applyDateRange()">
       </div>
     </div>
     <div class="header-right">
@@ -1559,6 +1697,24 @@ const adminHTML = `<!DOCTYPE html>
       <div class="stat-card">
         <div class="label">Cache Savings</div>
         <div class="value savings token-num" id="cacheSavings">$0.00</div>
+      </div>
+    </div>
+    <div class="charts-grid">
+      <div class="chart-card">
+        <div class="chart-card-header">
+          <span>Requests &amp; Cost Over Time</span>
+          <select class="chart-select" id="keyFilter" onchange="loadStats()">
+            <option value="">All Keys</option>
+          </select>
+        </div>
+        <canvas class="chart-canvas" id="timeseriesChart"></canvas>
+      </div>
+      <div class="chart-card">
+        <div class="chart-card-header">
+          <span>Cost by Key</span>
+        </div>
+        <canvas class="chart-canvas" id="distributionChart"></canvas>
+        <div class="chart-legend" id="distributionLegend"></div>
       </div>
     </div>
     <div class="section">
@@ -1648,55 +1804,9 @@ const adminHTML = `<!DOCTYPE html>
 <script>
 const API = '/admin/api';
 let refreshTimer;
-let currentSince = 0; // 0 = all time, otherwise minutes
+let currentFrom = ''; // ISO string or ''
+let currentTo = '';   // ISO string or ''
 
-const MODEL_PRICING = {
-  'claude-opus-4-6':              { input: 15, output: 75 },
-  'claude-opus-4-20250514':       { input: 15, output: 75 },
-  'claude-opus-4-0':              { input: 15, output: 75 },
-  'claude-sonnet-4-6':            { input: 3,  output: 15 },
-  'claude-sonnet-4-20250514':     { input: 3,  output: 15 },
-  'claude-sonnet-4-0':            { input: 3,  output: 15 },
-  'claude-3-5-sonnet-20241022':   { input: 3,  output: 15 },
-  'claude-3-5-sonnet-20240620':   { input: 3,  output: 15 },
-  'claude-haiku-4-5-20251001':    { input: 0.8, output: 4 },
-  'claude-3-5-haiku-20241022':    { input: 0.8, output: 4 },
-  'claude-3-opus-20240229':       { input: 15, output: 75 },
-  'claude-3-sonnet-20240229':     { input: 3,  output: 15 },
-  'claude-3-haiku-20240307':      { input: 0.25, output: 1.25 },
-};
-const DEFAULT_PRICING = { input: 3, output: 15 };
-
-function getPricing(model) {
-  if (MODEL_PRICING[model]) return MODEL_PRICING[model];
-  for (const [key, val] of Object.entries(MODEL_PRICING)) {
-    if (model && model.startsWith(key.split('-2')[0])) return val;
-  }
-  return DEFAULT_PRICING;
-}
-
-function calcCost(byModel) {
-  let total = 0;
-  if (!byModel) return total;
-  for (const [model, usage] of Object.entries(byModel)) {
-    const p = getPricing(model);
-    total += (usage.input_tokens * p.input
-            + usage.output_tokens * p.output
-            + (usage.cache_creation_input_tokens || 0) * p.input * 1.25
-            + (usage.cache_read_input_tokens || 0) * p.input * 0.1) / 1_000_000;
-  }
-  return total;
-}
-
-function calcCacheSavings(byModel) {
-  let savings = 0;
-  if (!byModel) return savings;
-  for (const [model, usage] of Object.entries(byModel)) {
-    const p = getPricing(model);
-    savings += ((usage.cache_read_input_tokens || 0) * p.input * 0.9) / 1_000_000;
-  }
-  return savings;
-}
 
 function formatCost(cost) {
   if (cost < 0.01) return '$' + cost.toFixed(4);
@@ -1717,20 +1827,56 @@ function formatRelTime(iso) {
   return Math.floor(diff / 86400) + 'd ago';
 }
 
-function setTimeRange(el) {
-  document.querySelectorAll('.time-filter button[data-since]').forEach(b => b.classList.remove('active'));
-  el.classList.add('active');
-  currentSince = parseInt(el.dataset.since, 10);
-  document.getElementById('customMins').value = '';
-  loadKeys();
+function toDatetimeLocal(d) {
+  // Convert Date to datetime-local string (local time, no seconds)
+  const pad = n => String(n).padStart(2, '0');
+  return d.getFullYear() + '-' + pad(d.getMonth()+1) + '-' + pad(d.getDate()) +
+         'T' + pad(d.getHours()) + ':' + pad(d.getMinutes());
 }
 
-function applyCustomRange() {
-  const v = parseInt(document.getElementById('customMins').value, 10);
-  if (!v || v <= 0) return;
-  document.querySelectorAll('.time-filter button[data-since]').forEach(b => b.classList.remove('active'));
-  currentSince = v;
+function fromDatetimeLocal(s) {
+  return s ? new Date(s).toISOString() : '';
+}
+
+function buildRangeParams() {
+  const p = new URLSearchParams();
+  if (currentFrom) p.set('from', currentFrom);
+  if (currentTo) p.set('to', currentTo);
+  return p.toString() ? '?' + p.toString() : '';
+}
+
+function setPreset(el) {
+  document.querySelectorAll('.time-filter button[data-preset]').forEach(b => b.classList.remove('active'));
+  el.classList.add('active');
+  const preset = el.dataset.preset;
+  const now = new Date();
+  let from = null;
+  if (preset === '5m')  from = new Date(now - 5*60*1000);
+  else if (preset === '1h')  from = new Date(now - 60*60*1000);
+  else if (preset === '1d')  from = new Date(now - 24*60*60*1000);
+  else if (preset === '7d')  from = new Date(now - 7*24*60*60*1000);
+  else if (preset === '30d') from = new Date(now - 30*24*60*60*1000);
+  // 'all' => from = null
+  currentFrom = from ? from.toISOString() : '';
+  currentTo = '';
+  document.getElementById('dtFrom').value = from ? toDatetimeLocal(from) : '';
+  document.getElementById('dtTo').value = '';
+  loadAll();
+}
+
+function applyDateRange() {
+  const fromStr = document.getElementById('dtFrom').value;
+  const toStr = document.getElementById('dtTo').value;
+  currentFrom = fromDatetimeLocal(fromStr);
+  currentTo = fromDatetimeLocal(toStr);
+  // Deselect preset buttons
+  document.querySelectorAll('.time-filter button[data-preset]').forEach(b => b.classList.remove('active'));
+  loadAll();
+}
+
+function loadAll() {
   loadKeys();
+  loadStats();
 }
 
 async function login() {
@@ -1775,13 +1921,13 @@ function showDashboard() {
   if (refreshTimer) clearInterval(refreshTimer);
   document.getElementById('loginPage').style.display = 'none';
   document.getElementById('dashboard').style.display = 'block';
-  loadKeys();
+  loadAll();
   loadToken();
-  refreshTimer = setInterval(loadKeys, 30000);
+  refreshTimer = setInterval(loadAll, 30000);
 }
 
 async function loadKeys() {
-  const url = currentSince > 0 ? API + '/keys?since=' + currentSince : API + '/keys';
+  const url = API + '/keys' + buildRangeParams();
   let res;
   try { res = await fetch(url); } catch(e) { return; }
   if (!res.ok) {
@@ -1802,9 +1948,9 @@ async function loadKeys() {
     totalOut += k.output_tokens;
     totalCacheW += k.cache_creation_input_tokens || 0;
     totalCacheR += k.cache_read_input_tokens || 0;
-    const keyCost = calcCost(k.by_model);
+    const keyCost = k.cost_usd || 0;
     totalCostVal += keyCost;
-    totalSavingsVal += calcCacheSavings(k.by_model);
+    totalSavingsVal += k.cache_savings_usd || 0;
 
     let modelDetail = '';
     if (k.by_model && Object.keys(k.by_model).length > 0) {
@@ -1877,6 +2023,231 @@ async function loadKeys() {
   document.getElementById('cacheHitRate').textContent = totalAllInput > 0
     ? (totalCacheR / totalAllInput * 100).toFixed(1) + '%'
     : '-';
+  // Also refresh key filter dropdown while keeping current selection.
+  populateKeyFilter(keys);
+}
+
+let _lastKeys = [];
+function populateKeyFilter(keys) {
+  _lastKeys = keys;
+  const sel = document.getElementById('keyFilter');
+  const prev = sel.value;
+  sel.innerHTML = '<option value="">All Keys</option>';
+  for (const k of keys) {
+    const opt = document.createElement('option');
+    opt.value = k.key;
+    opt.textContent = k.name;
+    sel.appendChild(opt);
+  }
+  if ([...sel.options].some(o => o.value === prev)) sel.value = prev;
+}
+
+async function loadStats() {
+  const p = new URLSearchParams();
+  if (currentFrom) p.set('from', currentFrom);
+  if (currentTo) p.set('to', currentTo);
+  const keyFilter = document.getElementById('keyFilter');
+  if (keyFilter && keyFilter.value) p.set('key', keyFilter.value);
+  const qs = p.toString() ? '?' + p.toString() : '';
+  let res;
+  try { res = await fetch(API + '/stats' + qs); } catch(e) { return; }
+  if (!res.ok) return;
+  const buckets = await res.json();
+  renderTimeseriesChart(buckets);
+  renderDistributionChart(_lastKeys, keyFilter ? keyFilter.value : '');
+}
+
+function formatBucketLabel(isoStr) {
+  const d = new Date(isoStr);
+  // Detect granularity from string: contains 'T' and non-zero hour → hourly
+  if (isoStr.includes('T') && isoStr.slice(11, 13) !== '00') {
+    return (d.getMonth()+1) + '/' + d.getDate() + ' ' + String(d.getHours()).padStart(2,'0') + ':00';
+  }
+  return (d.getMonth()+1) + '/' + d.getDate();
+}
+
+function renderTimeseriesChart(buckets) {
+  const canvas = document.getElementById('timeseriesChart');
+  if (!canvas) return;
+  canvas._lastBuckets = buckets;
+  const dpr = window.devicePixelRatio || 1;
+  const W = canvas.offsetWidth || 400;
+  const H = canvas.offsetHeight || 200;
+  canvas.width = W * dpr;
+  canvas.height = H * dpr;
+  const ctx = canvas.getContext('2d');
+  ctx.scale(dpr, dpr);
+
+  const PAD = { top: 20, right: 55, bottom: 36, left: 55 };
+  const cw = W - PAD.left - PAD.right;
+  const ch = H - PAD.top - PAD.bottom;
+
+  ctx.clearRect(0, 0, W, H);
+
+  if (!buckets || buckets.length === 0) {
+    ctx.fillStyle = '#6e7681';
+    ctx.font = '13px "Fira Code", monospace';
+    ctx.textAlign = 'center';
+    ctx.fillText('No data for selected range', W/2, H/2);
+    return;
+  }
+
+  const maxReq = Math.max(...buckets.map(b => b.requests), 1);
+  const maxCost = Math.max(...buckets.map(b => b.cost_usd), 0.000001);
+  const n = buckets.length;
+
+  // Grid lines
+  ctx.strokeStyle = '#21262d';
+  ctx.lineWidth = 1;
+  for (let i = 0; i <= 4; i++) {
+    const y = PAD.top + (ch / 4) * i;
+    ctx.beginPath(); ctx.moveTo(PAD.left, y); ctx.lineTo(PAD.left + cw, y); ctx.stroke();
+  }
+
+  // Left axis labels (requests, blue)
+  ctx.fillStyle = '#58a6ff';
+  ctx.font = '10px "Fira Code", monospace';
+  ctx.textAlign = 'right';
+  for (let i = 0; i <= 4; i++) {
+    const val = Math.round(maxReq * (1 - i/4));
+    ctx.fillText(val, PAD.left - 4, PAD.top + (ch/4)*i + 4);
+  }
+
+  // Right axis labels (cost, green)
+  ctx.fillStyle = '#3fb950';
+  ctx.textAlign = 'left';
+  for (let i = 0; i <= 4; i++) {
+    const val = (maxCost * (1 - i/4));
+    const label = val < 0.01 ? '$' + val.toFixed(4) : '$' + val.toFixed(2);
+    ctx.fillText(label, PAD.left + cw + 4, PAD.top + (ch/4)*i + 4);
+  }
+
+  function xPos(i) { return PAD.left + (n === 1 ? cw/2 : (i / (n-1)) * cw); }
+
+  // Requests line (blue)
+  ctx.strokeStyle = '#58a6ff';
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  buckets.forEach((b, i) => {
+    const x = xPos(i);
+    const y = PAD.top + ch * (1 - b.requests / maxReq);
+    i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+  });
+  ctx.stroke();
+
+  // Cost line (green)
+  ctx.strokeStyle = '#3fb950';
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  buckets.forEach((b, i) => {
+    const x = xPos(i);
+    const y = PAD.top + ch * (1 - b.cost_usd / maxCost);
+    i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+  });
+  ctx.stroke();
+
+  // X axis labels (sparse, max 8)
+  ctx.fillStyle = '#8b949e';
+  ctx.textAlign = 'center';
+  ctx.font = '10px "Fira Code", monospace';
+  const step = Math.ceil(n / 8);
+  for (let i = 0; i < n; i += step) {
+    const x = xPos(i);
+    ctx.fillText(formatBucketLabel(buckets[i].time), x, PAD.top + ch + 18);
+  }
+  // Always label last bucket
+  if ((n-1) % step !== 0) {
+    ctx.fillText(formatBucketLabel(buckets[n-1].time), xPos(n-1), PAD.top + ch + 18);
+  }
+}
+
+function renderDistributionChart(keys, filterKey) {
+  const canvas = document.getElementById('distributionChart');
+  const legend = document.getElementById('distributionLegend');
+  if (!canvas) return;
+
+  const data = filterKey
+    ? keys.filter(k => k.key === filterKey)
+    : keys.filter(k => (k.cost_usd || 0) > 0);
+
+  const dpr = window.devicePixelRatio || 1;
+  const W = canvas.offsetWidth || 400;
+  const H = canvas.offsetHeight || 160;
+  canvas.width = W * dpr;
+  canvas.height = H * dpr;
+  const ctx = canvas.getContext('2d');
+  ctx.scale(dpr, dpr);
+  ctx.clearRect(0, 0, W, H);
+
+  if (data.length === 0) {
+    ctx.fillStyle = '#6e7681';
+    ctx.font = '13px "Fira Code", monospace';
+    ctx.textAlign = 'center';
+    ctx.fillText('No cost data', W/2, H/2);
+    if (legend) legend.innerHTML = '';
+    return;
+  }
+
+  const BAR_COLORS = ['#58a6ff','#3fb950','#d29922','#f85149','#bc8cff','#79c0ff','#56d364','#ffa657'];
+  const PAD = { top: 12, right: 12, bottom: 28, left: 48 };
+  const cw = W - PAD.left - PAD.right;
+  const ch = H - PAD.top - PAD.bottom;
+  const maxCost = Math.max(...data.map(k => k.cost_usd || 0), 0.000001);
+  const barW = Math.max(4, cw / data.length * 0.6);
+  const gap = cw / data.length;
+
+  // Grid
+  ctx.strokeStyle = '#21262d';
+  ctx.lineWidth = 1;
+  for (let i = 0; i <= 3; i++) {
+    const y = PAD.top + (ch/3)*i;
+    ctx.beginPath(); ctx.moveTo(PAD.left, y); ctx.lineTo(PAD.left+cw, y); ctx.stroke();
+  }
+
+  // Left axis
+  ctx.fillStyle = '#8b949e';
+  ctx.font = '10px "Fira Code", monospace';
+  ctx.textAlign = 'right';
+  for (let i = 0; i <= 3; i++) {
+    const val = maxCost * (1 - i/3);
+    ctx.fillText(val < 0.01 ? '$'+val.toFixed(4) : '$'+val.toFixed(2), PAD.left-4, PAD.top+(ch/3)*i+4);
+  }
+
+  // Bars
+  data.forEach((k, i) => {
+    const cost = k.cost_usd || 0;
+    const barH = ch * (cost / maxCost);
+    const x = PAD.left + gap * (i + 0.5) - barW/2;
+    const y = PAD.top + ch - barH;
+    ctx.fillStyle = BAR_COLORS[i % BAR_COLORS.length];
+    ctx.beginPath();
+    ctx.roundRect ? ctx.roundRect(x, y, barW, barH, [3,3,0,0]) : ctx.rect(x, y, barW, barH);
+    ctx.fill();
+    // X label
+    ctx.fillStyle = '#8b949e';
+    ctx.textAlign = 'center';
+    ctx.font = '10px "Fira Code", monospace';
+    const label = k.name.length > 8 ? k.name.slice(0, 7) + '…' : k.name;
+    ctx.fillText(label, PAD.left + gap*(i+0.5), PAD.top+ch+16);
+  });
+
+  // Legend
+  if (legend) {
+    legend.innerHTML = data.map((k, i) =>
+      '<span class="legend-item"><span class="legend-dot" style="background:' + BAR_COLORS[i%BAR_COLORS.length] + '"></span>' +
+      escHtml(k.name) + ': ' + formatCost(k.cost_usd||0) + '</span>'
+    ).join('');
+  }
+}
+
+// Redraw charts on container resize
+if (window.ResizeObserver) {
+  const ro = new ResizeObserver(() => {
+    const el = document.getElementById('timeseriesChart');
+    if (el && el._lastBuckets) renderTimeseriesChart(el._lastBuckets);
+    renderDistributionChart(_lastKeys, document.getElementById('keyFilter')?.value || '');
+  });
+  document.querySelectorAll('.chart-card').forEach(c => ro.observe(c));
 }
 
 function showAddModal() {
