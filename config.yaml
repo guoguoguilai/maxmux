@@ -1,6 +1,5 @@
 port: 4000
 upstream: https://api.anthropic.com
-oauth_token: sk-ant-oat01-YOUR-TOKEN-HERE
 
 admin:
   username: admin

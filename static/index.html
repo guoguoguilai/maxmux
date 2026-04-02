@@ -1,0 +1,963 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Maxmux Admin</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Fira+Code:wght@400;500;600&family=Fira+Sans:wght@300;400;500;600&display=swap" rel="stylesheet">
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: 'Fira Sans', -apple-system, BlinkMacSystemFont, sans-serif; background: #0d1117; color: #e6edf3; min-height: 100vh; font-size: 14px; }
+
+  /* ── Login ── */
+  .login-container { display: flex; justify-content: center; align-items: center; min-height: 100vh; background: #0d1117; }
+  .login-box { background: #161b22; border: 1px solid #30363d; padding: 40px; border-radius: 12px; width: 360px; }
+  .login-logo { font-family: 'Fira Code', monospace; font-size: 22px; font-weight: 600; color: #58a6ff; margin-bottom: 6px; letter-spacing: -0.5px; }
+  .login-sub { color: #8b949e; margin-bottom: 28px; font-size: 13px; }
+  .form-group { margin-bottom: 16px; }
+  .form-group label { display: block; font-size: 12px; font-weight: 500; margin-bottom: 6px; color: #8b949e; text-transform: uppercase; letter-spacing: 0.05em; }
+  .form-group input { width: 100%; padding: 9px 12px; background: #0d1117; border: 1px solid #30363d; border-radius: 6px; font-size: 14px; color: #e6edf3; outline: none; transition: border-color 0.15s; font-family: inherit; }
+  .form-group input:focus { border-color: #58a6ff; box-shadow: 0 0 0 3px rgba(88,166,255,0.1); }
+  .btn { padding: 8px 16px; border: none; border-radius: 6px; font-size: 13px; font-weight: 500; cursor: pointer; transition: all 0.15s; font-family: inherit; white-space: nowrap; }
+  .btn-primary { background: #238636; color: #fff; }
+  .btn-primary:hover { background: #2ea043; }
+  .btn-blue { background: #1f6feb; color: #fff; }
+  .btn-blue:hover { background: #388bfd; }
+  .btn-danger { background: #da3633; color: #fff; }
+  .btn-danger:hover { background: #f85149; }
+  .btn-secondary { background: #21262d; color: #c9d1d9; border: 1px solid #30363d; }
+  .btn-secondary:hover { background: #30363d; }
+  .btn-sm { padding: 5px 10px; font-size: 12px; }
+  .btn-login { width: 100%; padding: 10px; font-size: 14px; margin-top: 4px; }
+  .error-msg { color: #f85149; font-size: 12px; margin-top: 10px; display: none; background: rgba(248,81,73,0.1); padding: 8px 12px; border-radius: 6px; border: 1px solid rgba(248,81,73,0.2); }
+
+  /* ── Layout ── */
+  .dashboard { display: none; }
+  .header { background: #161b22; border-bottom: 1px solid #21262d; padding: 12px 24px; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 10px; position: sticky; top: 0; z-index: 50; }
+  .header-left { display: flex; align-items: center; gap: 16px; }
+  .header-logo { font-family: 'Fira Code', monospace; font-size: 16px; font-weight: 600; color: #58a6ff; letter-spacing: -0.5px; }
+  .header-right { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .content { max-width: 1280px; margin: 24px auto; padding: 0 24px; }
+
+  /* ── Time filter ── */
+  .time-filter { display: flex; gap: 4px; align-items: center; flex-wrap: wrap; }
+  .time-filter button { padding: 4px 10px; border: 1px solid #30363d; border-radius: 6px; background: transparent; font-size: 12px; cursor: pointer; color: #8b949e; transition: all 0.15s; font-family: 'Fira Code', monospace; }
+  .time-filter button:hover { background: #21262d; color: #e6edf3; border-color: #58a6ff; }
+  .time-filter button.active { background: #1f6feb; color: #fff; border-color: #1f6feb; }
+  .datetime-range { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; margin-top: 6px; }
+  .datetime-range label { font-size: 11px; color: #8b949e; text-transform: uppercase; letter-spacing: 0.05em; }
+  .datetime-range input[type="datetime-local"] { padding: 4px 8px; background: #0d1117; border: 1px solid #30363d; border-radius: 6px; font-size: 12px; color: #e6edf3; font-family: 'Fira Code', monospace; outline: none; color-scheme: dark; }
+  .datetime-range input[type="datetime-local"]:focus { border-color: #58a6ff; }
+
+  /* ── Charts ── */
+  .charts-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-bottom: 16px; }
+  .chart-card { background: #161b22; border: 1px solid #21262d; border-radius: 8px; padding: 20px; }
+  .chart-card-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; }
+  .chart-card-header h3 { font-size: 13px; font-weight: 600; color: #e6edf3; }
+  .chart-select { padding: 4px 8px; background: #0d1117; border: 1px solid #30363d; border-radius: 6px; font-size: 12px; color: #e6edf3; font-family: inherit; outline: none; cursor: pointer; }
+  .chart-select:focus { border-color: #58a6ff; }
+  .chart-canvas { width: 100%; height: 200px; display: block; }
+  .chart-legend { display: flex; gap: 12px; margin-top: 8px; flex-wrap: wrap; }
+  .legend-item { display: flex; align-items: center; gap: 4px; font-size: 11px; color: #8b949e; }
+  .legend-dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; flex-shrink: 0; }
+
+  /* ── Stats ── */
+  .stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin-bottom: 16px; }
+  .stat-card { background: #161b22; border: 1px solid #21262d; padding: 16px 20px; border-radius: 8px; }
+  .stat-card .label { font-size: 11px; color: #8b949e; margin-bottom: 6px; text-transform: uppercase; letter-spacing: 0.05em; }
+  .stat-card .value { font-size: 24px; font-weight: 600; font-family: 'Fira Code', monospace; color: #e6edf3; }
+  .stat-card .value.cost { color: #3fb950; }
+  .stat-card .value.savings { color: #58a6ff; }
+
+  /* ── Section / Table ── */
+  .section { background: #161b22; border: 1px solid #21262d; border-radius: 8px; padding: 20px; margin-bottom: 16px; }
+  .section-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; }
+  .section-header h2 { font-size: 14px; font-weight: 600; color: #e6edf3; }
+  .section-actions { display: flex; gap: 8px; align-items: center; }
+  table { width: 100%; border-collapse: collapse; }
+  th { text-align: left; padding: 8px 12px; font-size: 11px; font-weight: 500; color: #8b949e; text-transform: uppercase; letter-spacing: 0.05em; border-bottom: 1px solid #21262d; }
+  td { padding: 12px 12px; border-bottom: 1px solid #161b22; font-size: 13px; vertical-align: middle; }
+  tr:hover td { background: #1c2128; }
+  tr:last-child td { border-bottom: none; }
+  .mono { font-family: 'Fira Code', monospace; font-size: 12px; color: #8b949e; }
+  .cost-cell { color: #3fb950; font-weight: 500; font-family: 'Fira Code', monospace; }
+  .name-cell { font-weight: 500; color: #e6edf3; }
+  .model-detail { font-size: 11px; color: #6e7681; margin-top: 3px; }
+  .model-detail span { margin-right: 8px; }
+
+  /* ── Budget bar ── */
+  .budget-wrap { min-width: 120px; }
+  .budget-nums { font-size: 12px; font-family: 'Fira Code', monospace; margin-bottom: 4px; display: flex; justify-content: space-between; align-items: baseline; gap: 6px; }
+  .budget-bar-bg { background: #21262d; border-radius: 3px; height: 4px; overflow: hidden; }
+  .budget-bar-fill { height: 4px; border-radius: 3px; transition: width 0.3s; }
+  .budget-label { font-size: 11px; color: #6e7681; margin-top: 3px; }
+  .limit-edit { font-size: 11px; color: #58a6ff; text-decoration: none; cursor: pointer; background: none; border: none; padding: 0; font-family: inherit; }
+  .limit-edit:hover { text-decoration: underline; }
+
+  /* ── Tag / badge ── */
+  .tag { display: inline-block; padding: 2px 7px; border-radius: 4px; font-size: 11px; font-weight: 500; }
+  .tag-green { background: rgba(63,185,80,0.15); color: #3fb950; }
+  .tag-yellow { background: rgba(210,153,34,0.15); color: #d29922; }
+  .tag-red { background: rgba(248,81,73,0.15); color: #f85149; }
+  .tag-gray { background: rgba(110,118,129,0.15); color: #6e7681; }
+
+  /* ── Modal ── */
+  .modal-overlay { display: none; position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,0.6); z-index: 200; justify-content: center; align-items: center; }
+  .modal-overlay.active { display: flex; }
+  .modal { background: #161b22; border: 1px solid #30363d; padding: 28px; border-radius: 10px; width: 420px; box-shadow: 0 16px 48px rgba(0,0,0,0.5); }
+  .modal h2 { margin-bottom: 20px; font-size: 16px; color: #e6edf3; }
+  .modal .form-group { margin-bottom: 14px; }
+  .modal .form-group:last-of-type { margin-bottom: 20px; }
+  .modal-actions { display: flex; gap: 8px; justify-content: flex-end; }
+  .modal-hint { font-size: 12px; color: #6e7681; margin-top: 5px; }
+  .input-row { display: flex; gap: 8px; }
+  .input-row input { flex: 1; }
+
+  /* ── Settings ── */
+  .settings-row { display: flex; gap: 8px; align-items: center; }
+  .settings-row input { flex: 1; padding: 8px 12px; background: #0d1117; border: 1px solid #30363d; border-radius: 6px; font-size: 13px; color: #e6edf3; font-family: 'Fira Code', monospace; outline: none; }
+  .settings-row input:focus { border-color: #58a6ff; }
+  .token-current { font-size: 12px; color: #6e7681; margin-top: 6px; }
+  .token-current span { color: #8b949e; font-family: 'Fira Code', monospace; }
+
+  /* ── Toast ── */
+  .toast { position: fixed; bottom: 24px; right: 24px; background: #1f2937; border: 1px solid #374151; color: #e6edf3; padding: 10px 16px; border-radius: 8px; font-size: 13px; z-index: 999; opacity: 0; transform: translateY(8px); transition: all 0.2s; pointer-events: none; }
+  .toast.show { opacity: 1; transform: translateY(0); }
+
+  .token-num { font-variant-numeric: tabular-nums; }
+
+  /* ── Key Filter Dropdown ── */
+  .key-filter { position: relative; }
+  .key-filter-btn { padding: 4px 10px; border: 1px solid #30363d; border-radius: 6px; background: transparent; font-size: 12px; cursor: pointer; color: #8b949e; font-family: 'Fira Code', monospace; transition: all 0.15s; }
+  .key-filter-btn:hover { background: #21262d; color: #e6edf3; border-color: #58a6ff; }
+  .key-filter-btn.has-filter { background: #1f6feb; color: #fff; border-color: #1f6feb; }
+  .key-filter-panel { display: none; position: absolute; top: calc(100% + 4px); left: 0; background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 8px 0; min-width: 200px; max-height: 300px; overflow-y: auto; z-index: 100; box-shadow: 0 8px 24px rgba(0,0,0,0.4); }
+  .key-filter-panel.open { display: block; }
+  .key-filter-item { display: flex; align-items: center; gap: 8px; padding: 6px 12px; cursor: pointer; font-size: 12px; color: #e6edf3; transition: background 0.1s; }
+  .key-filter-item:hover { background: #21262d; }
+  .key-filter-item input[type="checkbox"] { accent-color: #58a6ff; }
+  .key-filter-actions { display: flex; gap: 8px; padding: 6px 12px; border-top: 1px solid #21262d; margin-top: 4px; }
+  .key-filter-actions button { font-size: 11px; color: #58a6ff; background: none; border: none; cursor: pointer; padding: 2px 0; font-family: inherit; }
+  .key-filter-actions button:hover { text-decoration: underline; }
+
+  /* ── Sortable Table ── */
+  th.th-sort { cursor: pointer; user-select: none; white-space: nowrap; }
+  th.th-sort:hover { color: #e6edf3; }
+  th.th-sort .sort-arrow { display: inline-block; margin-left: 3px; font-size: 10px; color: #58a6ff; }
+
+  @media (max-width: 900px) {
+    .stats { grid-template-columns: repeat(2, 1fr); }
+    .charts-grid { grid-template-columns: 1fr; }
+    .content { padding: 0 16px; }
+    th, td { padding: 8px; font-size: 12px; }
+  }
+  @media (max-width: 500px) {
+    .stats { grid-template-columns: 1fr 1fr; }
+    .modal { width: calc(100vw - 32px); }
+  }
+</style>
+</head>
+<body>
+
+<div class="login-container" id="loginPage">
+  <div class="login-box">
+    <div class="login-logo">maxmux</div>
+    <div class="login-sub">Admin Dashboard</div>
+    <div class="form-group">
+      <label>Username</label>
+      <input type="text" id="username" autocomplete="username">
+    </div>
+    <div class="form-group">
+      <label>Password</label>
+      <input type="password" id="password" autocomplete="current-password">
+    </div>
+    <button class="btn btn-blue btn-login" onclick="login()">Sign In</button>
+    <div class="error-msg" id="loginError">Invalid username or password</div>
+  </div>
+</div>
+
+<div class="dashboard" id="dashboard">
+  <div class="header">
+    <div class="header-left">
+      <span class="header-logo">maxmux</span>
+      <div class="time-filter" id="timeFilter">
+        <button data-preset="5m" onclick="setPreset(this)">5m</button>
+        <button data-preset="1h" onclick="setPreset(this)">1h</button>
+        <button data-preset="1d" onclick="setPreset(this)">1d</button>
+        <button data-preset="7d" onclick="setPreset(this)">7d</button>
+        <button data-preset="30d" onclick="setPreset(this)">30d</button>
+        <button data-preset="all" class="active" onclick="setPreset(this)">All</button>
+      </div>
+      <div class="key-filter">
+        <button class="key-filter-btn" id="keyFilterBtn" onclick="toggleKeyFilterPanel()">All Keys</button>
+        <div class="key-filter-panel" id="keyFilterPanel"></div>
+      </div>
+      <div class="datetime-range">
+        <label>From</label>
+        <input type="datetime-local" id="dtFrom" onchange="applyDateRange()">
+        <label>To</label>
+        <input type="datetime-local" id="dtTo" onchange="applyDateRange()">
+      </div>
+    </div>
+    <div class="header-right">
+      <button class="btn btn-secondary btn-sm" onclick="logout()">Sign Out</button>
+    </div>
+  </div>
+  <div class="content">
+    <div class="stats">
+      <div class="stat-card">
+        <div class="label">Requests</div>
+        <div class="value token-num" id="totalRequests">0</div>
+      </div>
+      <div class="stat-card">
+        <div class="label">Input Tokens</div>
+        <div class="value token-num" id="totalInput">0</div>
+      </div>
+      <div class="stat-card">
+        <div class="label">Output Tokens</div>
+        <div class="value token-num" id="totalOutput">0</div>
+      </div>
+      <div class="stat-card">
+        <div class="label">Est. Cost</div>
+        <div class="value cost token-num" id="totalCost">$0.00</div>
+      </div>
+    </div>
+    <div class="stats">
+      <div class="stat-card">
+        <div class="label">Cache Write</div>
+        <div class="value token-num" id="totalCacheWrite">0</div>
+      </div>
+      <div class="stat-card">
+        <div class="label">Cache Read</div>
+        <div class="value token-num" id="totalCacheRead">0</div>
+      </div>
+      <div class="stat-card">
+        <div class="label">Cache Hit Rate</div>
+        <div class="value token-num" id="cacheHitRate">—</div>
+      </div>
+      <div class="stat-card">
+        <div class="label">Cache Savings</div>
+        <div class="value savings token-num" id="cacheSavings">$0.00</div>
+      </div>
+    </div>
+    <div class="charts-grid">
+      <div class="chart-card">
+        <div class="chart-card-header">
+          <span>Requests &amp; Cost Over Time</span>
+        </div>
+        <canvas class="chart-canvas" id="timeseriesChart"></canvas>
+      </div>
+      <div class="chart-card">
+        <div class="chart-card-header">
+          <span>Cost by Key</span>
+        </div>
+        <canvas class="chart-canvas" id="distributionChart"></canvas>
+        <div class="chart-legend" id="distributionLegend"></div>
+      </div>
+    </div>
+    <div class="section">
+      <div class="section-header">
+        <h2>Virtual Keys</h2>
+        <div class="section-actions">
+          <label class="btn btn-secondary btn-sm" style="cursor:pointer">Import CSV<input type="file" accept=".csv,.txt" style="display:none" onchange="importCSV(this)"></label>
+          <button class="btn btn-blue btn-sm" onclick="showAddModal()">+ Add Key</button>
+        </div>
+      </div>
+      <table>
+        <thead>
+          <tr>
+            <th class="th-sort" onclick="sortTable('name')">Name <span class="sort-arrow" id="sort-name"></span></th>
+            <th>Key</th>
+            <th>Status</th>
+            <th class="th-sort" onclick="sortTable('requests')">Requests <span class="sort-arrow" id="sort-requests"></span></th>
+            <th class="th-sort" onclick="sortTable('input')">Input <span class="sort-arrow" id="sort-input"></span></th>
+            <th class="th-sort" onclick="sortTable('output')">Output <span class="sort-arrow" id="sort-output"></span></th>
+            <th class="th-sort" onclick="sortTable('cost')">Est. Cost <span class="sort-arrow" id="sort-cost"></span></th>
+            <th class="th-sort" onclick="sortTable('budget')">Total Budget <span class="sort-arrow" id="sort-budget"></span></th>
+            <th class="th-sort" onclick="sortTable('daily')">Daily Budget <span class="sort-arrow" id="sort-daily"></span></th>
+            <th class="th-sort" onclick="sortTable('last_active')">Last Active <span class="sort-arrow" id="sort-last_active"></span></th>
+            <th></th>
+          </tr>
+        </thead>
+        <tbody id="keysTable"></tbody>
+      </table>
+    </div>
+    <div class="section">
+      <div class="section-header">
+        <h2>OAuth Tokens</h2>
+        <div class="section-actions">
+          <button class="btn btn-blue btn-sm" onclick="showAddTokenModal()">+ Add Token</button>
+        </div>
+      </div>
+      <p style="font-size:12px;color:#8b949e;margin-bottom:12px">Tokens are used in order. When the active token hits a rate limit (429/529), the system auto-rotates to the next enabled token.</p>
+      <table>
+        <thead>
+          <tr>
+            <th>#</th>
+            <th>Name</th>
+            <th>Token</th>
+            <th>Status</th>
+            <th></th>
+          </tr>
+        </thead>
+        <tbody id="tokensTable"></tbody>
+      </table>
+    </div>
+  </div>
+</div>
+
+<!-- Add Key Modal -->
+<div class="modal-overlay" id="addModal">
+  <div class="modal">
+    <h2>Add Virtual Key</h2>
+    <div class="form-group">
+      <label>Name</label>
+      <input type="text" id="newName" placeholder="e.g. Alice">
+    </div>
+    <div class="form-group">
+      <label>Key</label>
+      <input type="text" id="newKey" placeholder="e.g. sk-ant-...">
+    </div>
+    <div class="modal-actions">
+      <button class="btn btn-secondary" onclick="hideAddModal()">Cancel</button>
+      <button class="btn btn-blue" onclick="addKey()">Add Key</button>
+    </div>
+  </div>
+</div>
+
+<!-- Budget Modal -->
+<div class="modal-overlay" id="budgetModal">
+  <div class="modal">
+    <h2 id="budgetModalTitle">Set Limits</h2>
+    <input type="hidden" id="budgetKey">
+    <div class="form-group">
+      <label>Total Budget (USD)</label>
+      <input type="number" id="budgetTotal" placeholder="0 = unlimited" min="0" step="0.01">
+      <div class="modal-hint">Cumulative all-time spending cap. 0 = no limit.</div>
+    </div>
+    <div class="form-group">
+      <label>Daily Limit (USD)</label>
+      <input type="number" id="budgetDaily" placeholder="0 = unlimited" min="0" step="0.01">
+      <div class="modal-hint">Resets at midnight UTC each day. 0 = no limit.</div>
+    </div>
+    <div class="modal-actions">
+      <button class="btn btn-secondary" onclick="hideBudgetModal()">Cancel</button>
+      <button class="btn btn-blue" onclick="saveBudget()">Save</button>
+    </div>
+  </div>
+</div>
+
+<!-- Add Token Modal -->
+<div class="modal-overlay" id="addTokenModal">
+  <div class="modal">
+    <h2>Add OAuth Token</h2>
+    <div class="form-group">
+      <label>Name</label>
+      <input type="text" id="newTokenName" placeholder="e.g. Account 2">
+    </div>
+    <div class="form-group">
+      <label>Token</label>
+      <input type="text" id="newTokenValue" placeholder="sk-ant-oat01-...">
+    </div>
+    <div class="modal-actions">
+      <button class="btn btn-secondary" onclick="hideAddTokenModal()">Cancel</button>
+      <button class="btn btn-blue" onclick="addOAuthToken()">Add Token</button>
+    </div>
+  </div>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script>
+const API = '/admin/api';
+let refreshTimer;
+let currentFrom = '';
+let currentTo = '';
+let selectedKeys = [];
+let keyFilterActive = false; // true when user has explicitly filtered
+let _lastKeys = [];
+let currentSort = { col: '', dir: 'asc' }; // sortable table state
+
+// ── China timezone helpers ──
+function toChinaDate(d) { return new Date(d.getTime() + (d.getTimezoneOffset() + 480) * 60000); }
+function formatChinaTime(iso) {
+  if (!iso) return '—';
+  const d = new Date(iso);
+  const c = toChinaDate(d);
+  const pad = n => String(n).padStart(2, '0');
+  return c.getFullYear() + '-' + pad(c.getMonth()+1) + '-' + pad(c.getDate()) + ' ' + pad(c.getHours()) + ':' + pad(c.getMinutes());
+}
+function formatRelTime(iso) {
+  if (!iso) return '—';
+  const d = new Date(iso);
+  const diff = Math.floor((Date.now() - d.getTime()) / 1000);
+  if (diff < 60) return diff + 's ago';
+  if (diff < 3600) return Math.floor(diff / 60) + 'm ago';
+  if (diff < 86400) return Math.floor(diff / 3600) + 'h ago';
+  return Math.floor(diff / 86400) + 'd ago';
+}
+
+function formatCost(cost) {
+  if (cost < 0.01) return '$' + cost.toFixed(4);
+  return '$' + cost.toFixed(2);
+}
+function formatNumber(n) { return n.toLocaleString(); }
+
+function toDatetimeLocal(d) {
+  const pad = n => String(n).padStart(2, '0');
+  return d.getFullYear() + '-' + pad(d.getMonth()+1) + '-' + pad(d.getDate()) + 'T' + pad(d.getHours()) + ':' + pad(d.getMinutes());
+}
+function fromDatetimeLocal(s) { return s ? new Date(s).toISOString() : ''; }
+
+function buildRangeParams() {
+  const p = new URLSearchParams();
+  if (currentFrom) p.set('from', currentFrom);
+  if (currentTo) p.set('to', currentTo);
+  return p.toString() ? '?' + p.toString() : '';
+}
+
+function isKeySelected(key) {
+  if (!keyFilterActive) return true; // no filter applied → all visible
+  return selectedKeys.includes(key);
+}
+
+// ── Key filter dropdown ──
+function toggleKeyFilterPanel() {
+  document.getElementById('keyFilterPanel').classList.toggle('open');
+}
+function renderKeyFilterDropdown(keys) {
+  const panel = document.getElementById('keyFilterPanel');
+  let html = '';
+  for (const k of keys) {
+    const checked = isKeySelected(k.key) ? ' checked' : '';
+    html += '<label class="key-filter-item"><input type="checkbox" value="' + escAttr(k.key) + '"' + checked + ' onchange="onKeyFilterChange()"> ' + escHtml(k.name) + '</label>';
+  }
+  html += '<div class="key-filter-actions"><button onclick="selectAllKeys()">Select All</button><button onclick="clearKeyFilter()">Clear</button></div>';
+  panel.innerHTML = html;
+  updateKeyFilterBtn();
+}
+function onKeyFilterChange() {
+  const checks = document.querySelectorAll('#keyFilterPanel input[type=checkbox]');
+  const all = [...checks];
+  const checked = all.filter(c => c.checked).map(c => c.value);
+  if (checked.length === all.length) {
+    selectedKeys = [];
+    keyFilterActive = false;
+  } else {
+    selectedKeys = checked;
+    keyFilterActive = true;
+  }
+  updateKeyFilterBtn();
+  renderFilteredView();
+}
+function selectAllKeys() {
+  selectedKeys = [];
+  keyFilterActive = false;
+  document.querySelectorAll('#keyFilterPanel input[type=checkbox]').forEach(c => c.checked = true);
+  updateKeyFilterBtn();
+  renderFilteredView();
+}
+function clearKeyFilter() {
+  selectedKeys = [];
+  keyFilterActive = true; // active with empty selection = show nothing
+  document.querySelectorAll('#keyFilterPanel input[type=checkbox]').forEach(c => c.checked = false);
+  updateKeyFilterBtn();
+  renderFilteredView();
+}
+function updateKeyFilterBtn() {
+  const btn = document.getElementById('keyFilterBtn');
+  if (!keyFilterActive) {
+    btn.textContent = 'All Keys';
+    btn.classList.remove('has-filter');
+  } else {
+    btn.textContent = selectedKeys.length + ' selected';
+    btn.classList.add('has-filter');
+  }
+}
+function renderFilteredView() {
+  renderKeysTable(_lastKeys);
+  loadStats();
+}
+// Close panel when clicking outside
+document.addEventListener('click', e => {
+  const kf = document.querySelector('.key-filter');
+  if (kf && !kf.contains(e.target)) {
+    document.getElementById('keyFilterPanel').classList.remove('open');
+  }
+});
+
+// ── Sortable table ──
+function sortTable(col) {
+  if (currentSort.col === col) {
+    currentSort.dir = currentSort.dir === 'asc' ? 'desc' : 'asc';
+  } else {
+    currentSort.col = col;
+    currentSort.dir = 'asc';
+  }
+  updateSortArrows();
+  renderKeysTable(_lastKeys);
+}
+function updateSortArrows() {
+  document.querySelectorAll('.sort-arrow').forEach(el => el.textContent = '');
+  if (currentSort.col) {
+    const el = document.getElementById('sort-' + currentSort.col);
+    if (el) el.textContent = currentSort.dir === 'asc' ? '▲' : '▼';
+  }
+}
+function sortKeys(keys) {
+  if (!currentSort.col) return keys;
+  const sorted = [...keys];
+  const dir = currentSort.dir === 'asc' ? 1 : -1;
+  sorted.sort((a, b) => {
+    let va, vb;
+    switch (currentSort.col) {
+      case 'name': va = a.name.toLowerCase(); vb = b.name.toLowerCase(); return va < vb ? -dir : va > vb ? dir : 0;
+      case 'requests': va = a.request_count; vb = b.request_count; break;
+      case 'input': va = a.input_tokens; vb = b.input_tokens; break;
+      case 'output': va = a.output_tokens; vb = b.output_tokens; break;
+      case 'cost': va = a.cost_usd || 0; vb = b.cost_usd || 0; break;
+      case 'budget': va = a.budget_limit_usd || 0; vb = b.budget_limit_usd || 0; break;
+      case 'daily': va = a.cost_today_usd || 0; vb = b.cost_today_usd || 0; break;
+      case 'last_active': va = a.last_active ? new Date(a.last_active).getTime() : 0; vb = b.last_active ? new Date(b.last_active).getTime() : 0; break;
+      default: return 0;
+    }
+    return (va - vb) * dir;
+  });
+  return sorted;
+}
+
+// ── Time filter ──
+function setPreset(el) {
+  document.querySelectorAll('.time-filter button[data-preset]').forEach(b => b.classList.remove('active'));
+  el.classList.add('active');
+  const preset = el.dataset.preset;
+  const now = new Date();
+  let from = null;
+  if (preset === '5m')  from = new Date(now - 5*60*1000);
+  else if (preset === '1h')  from = new Date(now - 60*60*1000);
+  else if (preset === '1d')  from = new Date(now - 24*60*60*1000);
+  else if (preset === '7d')  from = new Date(now - 7*24*60*60*1000);
+  else if (preset === '30d') from = new Date(now - 30*24*60*60*1000);
+  currentFrom = from ? from.toISOString() : '';
+  currentTo = '';
+  document.getElementById('dtFrom').value = from ? toDatetimeLocal(from) : '';
+  document.getElementById('dtTo').value = '';
+  loadAll();
+}
+function applyDateRange() {
+  currentFrom = fromDatetimeLocal(document.getElementById('dtFrom').value);
+  currentTo = fromDatetimeLocal(document.getElementById('dtTo').value);
+  document.querySelectorAll('.time-filter button[data-preset]').forEach(b => b.classList.remove('active'));
+  loadAll();
+}
+
+async function loadAll() { await loadKeys(); loadStats(); }
+
+// ── Auth ──
+async function login() {
+  const username = document.getElementById('username').value;
+  const password = document.getElementById('password').value;
+  const res = await fetch(API + '/login', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ username, password }) });
+  if (res.ok) { showDashboard(); } else {
+    const el = document.getElementById('loginError');
+    el.style.display = 'block';
+    setTimeout(() => el.style.display = 'none', 3000);
+  }
+}
+document.getElementById('password').addEventListener('keydown', e => { if (e.key === 'Enter') login(); });
+document.getElementById('username').addEventListener('keydown', e => { if (e.key === 'Enter') document.getElementById('password').focus(); });
+
+async function logout() {
+  await fetch(API + '/logout', { method: 'POST' });
+  document.getElementById('dashboard').style.display = 'none';
+  document.getElementById('loginPage').style.display = 'flex';
+  clearInterval(refreshTimer);
+}
+
+async function checkSession() {
+  for (let i = 0; i < 3; i++) {
+    try {
+      const res = await fetch(API + '/session');
+      if (res.ok) { showDashboard(); return; }
+      if (res.status === 401) return;
+    } catch(e) {}
+    await new Promise(r => setTimeout(r, 500));
+  }
+}
+
+function showDashboard() {
+  if (refreshTimer) clearInterval(refreshTimer);
+  document.getElementById('loginPage').style.display = 'none';
+  document.getElementById('dashboard').style.display = 'block';
+  loadAll();
+  loadTokens();
+  refreshTimer = setInterval(loadAll, 30000);
+}
+
+// ── Load keys and render ──
+async function loadKeys() {
+  const url = API + '/keys' + buildRangeParams();
+  let res;
+  try { res = await fetch(url); } catch(e) { return; }
+  if (!res.ok) return;
+  const keys = await res.json();
+  _lastKeys = keys;
+  renderKeyFilterDropdown(keys);
+  renderKeysTable(keys);
+}
+
+function renderKeysTable(keys) {
+  const tbody = document.getElementById('keysTable');
+  // Filter by selected keys
+  const filtered = keyFilterActive ? keys.filter(k => selectedKeys.includes(k.key)) : keys;
+  // Sort
+  const sorted = sortKeys(filtered);
+
+  let totalReq = 0, totalIn = 0, totalOut = 0, totalCostVal = 0;
+  let totalCacheW = 0, totalCacheR = 0, totalSavingsVal = 0;
+  let html = '';
+  for (const k of sorted) {
+    totalReq += k.request_count;
+    totalIn += k.input_tokens;
+    totalOut += k.output_tokens;
+    totalCacheW += k.cache_creation_input_tokens || 0;
+    totalCacheR += k.cache_read_input_tokens || 0;
+    const keyCost = k.cost_usd || 0;
+    totalCostVal += keyCost;
+    totalSavingsVal += k.cache_savings_usd || 0;
+
+    let modelDetail = '';
+    if (k.by_model && Object.keys(k.by_model).length > 0) {
+      const parts = [];
+      for (const [model, usage] of Object.entries(k.by_model)) {
+        const shortName = model.replace('claude-', '').replace(/-\d{8}$/, '');
+        parts.push('<span>' + escHtml(shortName) + ': ' + formatNumber(usage.input_tokens) + '/' + formatNumber(usage.output_tokens) + '</span>');
+      }
+      modelDetail = '<div class="model-detail">' + parts.join('') + '</div>';
+    }
+
+    const budgetLimit = k.budget_limit_usd || 0;
+    let totalBudgetCell;
+    if (budgetLimit > 0) {
+      const pct = Math.min(keyCost / budgetLimit * 100, 100);
+      const barColor = pct >= 100 ? '#f85149' : pct >= 80 ? '#d29922' : '#3fb950';
+      totalBudgetCell = '<td><div class="budget-wrap">' +
+        '<div class="budget-nums"><span style="color:' + barColor + '">' + formatCost(keyCost) + '</span><span style="color:#6e7681">/ ' + formatCost(budgetLimit) + '</span></div>' +
+        '<div class="budget-bar-bg"><div class="budget-bar-fill" style="width:' + pct.toFixed(1) + '%;background:' + barColor + '"></div></div>' +
+        '<button class="limit-edit" onclick="showBudgetModal(\'' + escAttr(k.key) + '\',\'' + escAttr(k.name) + '\',' + budgetLimit + ',' + (k.daily_limit_usd||0) + ')">edit</button>' +
+        '</div></td>';
+    } else {
+      totalBudgetCell = '<td><button class="limit-edit" onclick="showBudgetModal(\'' + escAttr(k.key) + '\',\'' + escAttr(k.name) + '\',0,' + (k.daily_limit_usd||0) + ')">set limit</button></td>';
+    }
+
+    // Daily budget cell: always show actual usage / limit (or -1 if no limit)
+    const dailyLimit = k.daily_limit_usd || 0;
+    const costToday = k.cost_today_usd || 0;
+    let dailyBudgetCell;
+    if (dailyLimit > 0) {
+      const dpct = Math.min(costToday / dailyLimit * 100, 100);
+      const dcolor = dpct >= 100 ? '#f85149' : dpct >= 80 ? '#d29922' : '#58a6ff';
+      dailyBudgetCell = '<td><div class="budget-wrap">' +
+        '<div class="budget-nums"><span style="color:' + dcolor + '">' + formatCost(costToday) + '</span><span style="color:#6e7681">/ ' + formatCost(dailyLimit) + '</span></div>' +
+        '<div class="budget-bar-bg"><div class="budget-bar-fill" style="width:' + dpct.toFixed(1) + '%;background:' + dcolor + '"></div></div>' +
+        '<button class="limit-edit" onclick="showBudgetModal(\'' + escAttr(k.key) + '\',\'' + escAttr(k.name) + '\',' + budgetLimit + ',' + dailyLimit + ')">edit</button>' +
+        '</div></td>';
+    } else {
+      // No daily limit: show "actual / -1"
+      dailyBudgetCell = '<td><div class="budget-wrap">' +
+        '<div class="budget-nums"><span style="color:#58a6ff">' + formatCost(costToday) + '</span><span style="color:#6e7681">/ -1</span></div>' +
+        '<button class="limit-edit" onclick="showBudgetModal(\'' + escAttr(k.key) + '\',\'' + escAttr(k.name) + '\',' + budgetLimit + ',0)">set limit</button>' +
+        '</div></td>';
+    }
+
+    const lastActiveStr = k.last_active
+      ? '<span title="' + formatChinaTime(k.last_active) + '">' + formatRelTime(k.last_active) + '</span>'
+      : '<span style="color:#6e7681">—</span>';
+    const isDisabled = k.disabled;
+    const statusTag = isDisabled ? '<span class="tag tag-red">Disabled</span>' : '<span class="tag tag-green">Active</span>';
+    const toggleBtn = isDisabled
+      ? '<button class="btn btn-primary btn-sm" onclick="toggleKey(\'' + escAttr(k.key) + '\',false)">Enable</button>'
+      : '<button class="btn btn-secondary btn-sm" onclick="toggleKey(\'' + escAttr(k.key) + '\',true)">Disable</button>';
+    const rowStyle = isDisabled ? ' style="opacity:0.5"' : '';
+    html += '<tr' + rowStyle + '>' +
+      '<td class="name-cell">' + escHtml(k.name) + '</td>' +
+      '<td class="mono" style="white-space:nowrap">' + escHtml(k.masked_key) + ' <button class="limit-edit" onclick="copyKey(\'' + escAttr(k.key) + '\',this)">copy</button></td>' +
+      '<td>' + statusTag + '</td>' +
+      '<td class="token-num">' + formatNumber(k.request_count) + '</td>' +
+      '<td class="token-num">' + formatNumber(k.input_tokens) + modelDetail + '</td>' +
+      '<td class="token-num">' + formatNumber(k.output_tokens) + '</td>' +
+      '<td class="cost-cell token-num">' + formatCost(keyCost) + '</td>' +
+      totalBudgetCell +
+      dailyBudgetCell +
+      '<td style="white-space:nowrap;font-size:12px;color:#6e7681">' + lastActiveStr + '</td>' +
+      '<td style="white-space:nowrap">' + toggleBtn + ' <button class="btn btn-danger btn-sm" onclick="removeKey(\'' + escAttr(k.key) + '\',\'' + escAttr(k.name) + '\')">Delete</button></td>' +
+      '</tr>';
+  }
+  if (sorted.length === 0) {
+    html = '<tr><td colspan="11" style="text-align:center;color:#6e7681;padding:40px">No virtual keys configured</td></tr>';
+  }
+  tbody.innerHTML = html;
+
+  document.getElementById('totalRequests').textContent = formatNumber(totalReq);
+  document.getElementById('totalInput').textContent = formatNumber(totalIn);
+  document.getElementById('totalOutput').textContent = formatNumber(totalOut);
+  document.getElementById('totalCost').textContent = formatCost(totalCostVal);
+  document.getElementById('totalCacheWrite').textContent = formatNumber(totalCacheW);
+  document.getElementById('totalCacheRead').textContent = formatNumber(totalCacheR);
+  document.getElementById('cacheSavings').textContent = formatCost(totalSavingsVal);
+  const totalAllInput = totalIn + totalCacheR + totalCacheW;
+  document.getElementById('cacheHitRate').textContent = totalAllInput > 0
+    ? (totalCacheR / totalAllInput * 100).toFixed(1) + '%' : '-';
+}
+
+// ── Stats (timeseries) ──
+async function loadStats() {
+  const p = new URLSearchParams();
+  if (currentFrom) p.set('from', currentFrom);
+  if (currentTo) p.set('to', currentTo);
+  // Multi-key filter: pass selected keys
+  if (keyFilterActive && selectedKeys.length > 0) {
+    for (const k of selectedKeys) p.append('keys', k);
+  }
+  const qs = p.toString() ? '?' + p.toString() : '';
+  let res;
+  try { res = await fetch(API + '/stats' + qs); } catch(e) { return; }
+  if (!res.ok) return;
+  const buckets = await res.json();
+  renderTimeseriesChart(buckets);
+  // Distribution chart uses filtered keys from _lastKeys
+  const filteredKeys = keyFilterActive ? _lastKeys.filter(k => selectedKeys.includes(k.key)) : _lastKeys;
+  renderDistributionChart(filteredKeys);
+}
+
+function formatBucketLabel(isoStr) {
+  // Convert to China time for display
+  const d = new Date(isoStr);
+  const c = toChinaDate(d);
+  const pad = n => String(n).padStart(2, '0');
+  if (isoStr.includes('T') && isoStr.slice(11, 13) !== '00') {
+    return (c.getMonth()+1) + '/' + c.getDate() + ' ' + pad(c.getHours()) + ':00';
+  }
+  return (c.getMonth()+1) + '/' + c.getDate();
+}
+
+function renderTimeseriesChart(buckets) {
+  const canvas = document.getElementById('timeseriesChart');
+  if (!canvas) return;
+  canvas._lastBuckets = buckets;
+  const dpr = window.devicePixelRatio || 1;
+  const W = canvas.offsetWidth || 400;
+  const H = canvas.offsetHeight || 200;
+  canvas.width = W * dpr;
+  canvas.height = H * dpr;
+  const ctx = canvas.getContext('2d');
+  ctx.scale(dpr, dpr);
+  const PAD = { top: 20, right: 55, bottom: 36, left: 55 };
+  const cw = W - PAD.left - PAD.right;
+  const ch = H - PAD.top - PAD.bottom;
+  ctx.clearRect(0, 0, W, H);
+  if (!buckets || buckets.length === 0) {
+    ctx.fillStyle = '#6e7681'; ctx.font = '13px "Fira Code", monospace'; ctx.textAlign = 'center';
+    ctx.fillText('No data for selected range', W/2, H/2); return;
+  }
+  const maxReq = Math.max(...buckets.map(b => b.requests), 1);
+  const maxCost = Math.max(...buckets.map(b => b.cost_usd), 0.000001);
+  const n = buckets.length;
+  ctx.strokeStyle = '#21262d'; ctx.lineWidth = 1;
+  for (let i = 0; i <= 4; i++) { const y = PAD.top + (ch/4)*i; ctx.beginPath(); ctx.moveTo(PAD.left, y); ctx.lineTo(PAD.left+cw, y); ctx.stroke(); }
+  ctx.fillStyle = '#58a6ff'; ctx.font = '10px "Fira Code", monospace'; ctx.textAlign = 'right';
+  for (let i = 0; i <= 4; i++) ctx.fillText(Math.round(maxReq*(1-i/4)), PAD.left-4, PAD.top+(ch/4)*i+4);
+  ctx.fillStyle = '#3fb950'; ctx.textAlign = 'left';
+  for (let i = 0; i <= 4; i++) { const v = maxCost*(1-i/4); ctx.fillText(v < 0.01 ? '$'+v.toFixed(4) : '$'+v.toFixed(2), PAD.left+cw+4, PAD.top+(ch/4)*i+4); }
+  function xPos(i) { return PAD.left + (n === 1 ? cw/2 : (i/(n-1))*cw); }
+  ctx.strokeStyle = '#58a6ff'; ctx.lineWidth = 2; ctx.beginPath();
+  buckets.forEach((b, i) => { const x = xPos(i), y = PAD.top + ch*(1-b.requests/maxReq); i === 0 ? ctx.moveTo(x,y) : ctx.lineTo(x,y); }); ctx.stroke();
+  ctx.strokeStyle = '#3fb950'; ctx.lineWidth = 2; ctx.beginPath();
+  buckets.forEach((b, i) => { const x = xPos(i), y = PAD.top + ch*(1-b.cost_usd/maxCost); i === 0 ? ctx.moveTo(x,y) : ctx.lineTo(x,y); }); ctx.stroke();
+  ctx.fillStyle = '#8b949e'; ctx.textAlign = 'center'; ctx.font = '10px "Fira Code", monospace';
+  const step = Math.ceil(n/8);
+  for (let i = 0; i < n; i += step) ctx.fillText(formatBucketLabel(buckets[i].time), xPos(i), PAD.top+ch+18);
+  if ((n-1) % step !== 0) ctx.fillText(formatBucketLabel(buckets[n-1].time), xPos(n-1), PAD.top+ch+18);
+}
+
+function renderDistributionChart(data) {
+  const canvas = document.getElementById('distributionChart');
+  const legend = document.getElementById('distributionLegend');
+  if (!canvas) return;
+  const filtered = data.filter(k => (k.cost_usd || 0) > 0);
+  const dpr = window.devicePixelRatio || 1;
+  const W = canvas.offsetWidth || 400; const H = canvas.offsetHeight || 160;
+  canvas.width = W * dpr; canvas.height = H * dpr;
+  const ctx = canvas.getContext('2d'); ctx.scale(dpr, dpr); ctx.clearRect(0, 0, W, H);
+  if (filtered.length === 0) {
+    ctx.fillStyle = '#6e7681'; ctx.font = '13px "Fira Code", monospace'; ctx.textAlign = 'center';
+    ctx.fillText('No cost data', W/2, H/2); if (legend) legend.innerHTML = ''; return;
+  }
+  const BAR_COLORS = ['#58a6ff','#3fb950','#d29922','#f85149','#bc8cff','#79c0ff','#56d364','#ffa657'];
+  const PAD = { top: 12, right: 12, bottom: 28, left: 48 };
+  const cw = W-PAD.left-PAD.right, ch = H-PAD.top-PAD.bottom;
+  const maxCost = Math.max(...filtered.map(k => k.cost_usd||0), 0.000001);
+  const barW = Math.max(4, cw/filtered.length*0.6), gap = cw/filtered.length;
+  ctx.strokeStyle = '#21262d'; ctx.lineWidth = 1;
+  for (let i = 0; i <= 3; i++) { const y = PAD.top+(ch/3)*i; ctx.beginPath(); ctx.moveTo(PAD.left,y); ctx.lineTo(PAD.left+cw,y); ctx.stroke(); }
+  ctx.fillStyle = '#8b949e'; ctx.font = '10px "Fira Code", monospace'; ctx.textAlign = 'right';
+  for (let i = 0; i <= 3; i++) { const v = maxCost*(1-i/3); ctx.fillText(v < 0.01 ? '$'+v.toFixed(4) : '$'+v.toFixed(2), PAD.left-4, PAD.top+(ch/3)*i+4); }
+  filtered.forEach((k, i) => {
+    const cost = k.cost_usd||0, barH = ch*(cost/maxCost), x = PAD.left+gap*(i+0.5)-barW/2, y = PAD.top+ch-barH;
+    ctx.fillStyle = BAR_COLORS[i%BAR_COLORS.length]; ctx.beginPath();
+    ctx.roundRect ? ctx.roundRect(x,y,barW,barH,[3,3,0,0]) : ctx.rect(x,y,barW,barH); ctx.fill();
+    ctx.fillStyle = '#8b949e'; ctx.textAlign = 'center'; ctx.font = '10px "Fira Code", monospace';
+    const label = k.name.length > 8 ? k.name.slice(0,7)+'…' : k.name;
+    ctx.fillText(label, PAD.left+gap*(i+0.5), PAD.top+ch+16);
+  });
+  if (legend) {
+    legend.innerHTML = filtered.map((k,i) =>
+      '<span class="legend-item"><span class="legend-dot" style="background:'+BAR_COLORS[i%BAR_COLORS.length]+'"></span>'+escHtml(k.name)+': '+formatCost(k.cost_usd||0)+'</span>'
+    ).join('');
+  }
+}
+
+if (window.ResizeObserver) {
+  const ro = new ResizeObserver(() => {
+    const el = document.getElementById('timeseriesChart');
+    if (el && el._lastBuckets) renderTimeseriesChart(el._lastBuckets);
+    const fk = keyFilterActive ? _lastKeys.filter(k => selectedKeys.includes(k.key)) : _lastKeys;
+    renderDistributionChart(fk);
+  });
+  document.querySelectorAll('.chart-card').forEach(c => ro.observe(c));
+}
+
+// ── Key CRUD ──
+function showAddModal() { document.getElementById('newName').value = ''; document.getElementById('newKey').value = ''; document.getElementById('addModal').classList.add('active'); document.getElementById('newName').focus(); }
+function hideAddModal() { document.getElementById('addModal').classList.remove('active'); }
+async function addKey() {
+  const name = document.getElementById('newName').value.trim();
+  const key = document.getElementById('newKey').value.trim();
+  if (!name || !key) return;
+  await fetch(API + '/keys', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name, key }) });
+  hideAddModal(); loadKeys();
+}
+async function toggleKey(key, disabled) {
+  await fetch(API + '/keys/disable', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ key, disabled }) });
+  showToast(disabled ? 'Key disabled' : 'Key enabled'); loadKeys();
+}
+async function removeKey(key, name) {
+  if (!confirm('Delete key "' + name + '"? This will also delete all usage history.')) return;
+  await fetch(API + '/keys', { method: 'DELETE', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ key }) });
+  showToast('Key "' + name + '" deleted'); loadKeys();
+}
+
+function escHtml(s) { const d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
+function escAttr(s) { return s.replace(/\\/g, '\\\\').replace(/'/g, "\\'").replace(/"/g, '\\"'); }
+
+// ── OAuth Tokens ──
+async function loadTokens() {
+  let res; try { res = await fetch(API + '/tokens'); } catch(e) { return; }
+  if (!res.ok) return;
+  const tokens = await res.json();
+  const tbody = document.getElementById('tokensTable');
+  if (!tbody) return;
+  let html = '';
+  for (const t of tokens) {
+    const activeTag = t.active ? ' <span class="tag tag-green" style="margin-left:4px">IN USE</span>' : '';
+    const statusTag = t.disabled ? '<span class="tag tag-red">Disabled</span>' : '<span class="tag tag-green">Enabled</span>';
+    const toggleBtn = t.disabled
+      ? '<button class="btn btn-primary btn-sm" onclick="toggleOAuthToken('+t.id+',false)">Enable</button>'
+      : '<button class="btn btn-secondary btn-sm" onclick="toggleOAuthToken('+t.id+',true)">Disable</button>';
+    const useBtn = (t.active || t.disabled) ? '' : ' <button class="btn btn-blue btn-sm" onclick="switchOAuthToken('+t.id+')">Use</button>';
+    const rowStyle = t.disabled ? ' style="opacity:0.5"' : '';
+    html += '<tr'+rowStyle+'>' +
+      '<td class="mono">'+t.sort_order+'</td>' +
+      '<td class="name-cell">'+escHtml(t.name)+activeTag+'</td>' +
+      '<td class="mono">'+escHtml(t.masked_token)+'</td>' +
+      '<td>'+statusTag+'</td>' +
+      '<td style="white-space:nowrap">'+useBtn+' '+toggleBtn+
+      ' <button class="btn btn-danger btn-sm" onclick="removeOAuthToken('+t.id+',\''+escAttr(t.name)+'\')">Delete</button></td></tr>';
+  }
+  if (tokens.length === 0) html = '<tr><td colspan="5" style="text-align:center;color:#6e7681;padding:20px">No OAuth tokens configured</td></tr>';
+  tbody.innerHTML = html;
+}
+function showAddTokenModal() { document.getElementById('newTokenName').value = ''; document.getElementById('newTokenValue').value = ''; document.getElementById('addTokenModal').classList.add('active'); document.getElementById('newTokenName').focus(); }
+function hideAddTokenModal() { document.getElementById('addTokenModal').classList.remove('active'); }
+async function addOAuthToken() {
+  const name = document.getElementById('newTokenName').value.trim();
+  const token = document.getElementById('newTokenValue').value.trim();
+  if (!token) return;
+  await fetch(API + '/tokens', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ token, name: name || undefined }) });
+  hideAddTokenModal(); showToast('Token added'); loadTokens();
+}
+async function toggleOAuthToken(id, disabled) {
+  await fetch(API + '/tokens/disable', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id, disabled }) });
+  showToast(disabled ? 'Token disabled' : 'Token enabled'); loadTokens();
+}
+async function switchOAuthToken(id) {
+  await fetch(API + '/tokens/switch', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id }) });
+  showToast('Switched active token'); loadTokens();
+}
+async function removeOAuthToken(id, name) {
+  if (!confirm('Delete token "' + name + '"?')) return;
+  await fetch(API + '/tokens', { method: 'DELETE', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id }) });
+  showToast('Token deleted'); loadTokens();
+}
+
+// ── CSV Import ──
+async function importCSV(input) {
+  const file = input.files[0]; if (!file) return;
+  const text = await file.text();
+  const lines = text.trim().split('\n').filter(l => l.trim() && !l.startsWith('#'));
+  let added = 0, errors = 0;
+  for (const line of lines) {
+    const parts = line.split(',').map(s => s.trim());
+    if (parts.length < 2 || !parts[0] || !parts[1]) { errors++; continue; }
+    const [name, key] = parts;
+    const res = await fetch(API + '/keys', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name, key }) });
+    if (res.ok) added++; else errors++;
+  }
+  input.value = '';
+  alert('Imported ' + added + ' key(s)' + (errors > 0 ? ', ' + errors + ' failed' : ''));
+  loadKeys();
+}
+
+async function copyKey(key, el) {
+  try { await navigator.clipboard.writeText(key); const orig = el.textContent; el.textContent = 'copied!'; setTimeout(() => el.textContent = orig, 1500); }
+  catch(e) { showToast('Copy failed — check clipboard permissions'); }
+}
+
+// ── Budget Modal ──
+function showBudgetModal(key, name, currentTotal, currentDaily) {
+  document.getElementById('budgetKey').value = key;
+  document.getElementById('budgetModalTitle').textContent = 'Limits — ' + name;
+  document.getElementById('budgetTotal').value = currentTotal > 0 ? currentTotal : '';
+  document.getElementById('budgetDaily').value = currentDaily > 0 ? currentDaily : '';
+  document.getElementById('budgetModal').classList.add('active');
+  document.getElementById('budgetTotal').focus();
+}
+function hideBudgetModal() { document.getElementById('budgetModal').classList.remove('active'); }
+async function saveBudget() {
+  const key = document.getElementById('budgetKey').value;
+  const budget = document.getElementById('budgetTotal').value === '' ? 0 : parseFloat(document.getElementById('budgetTotal').value);
+  const daily = document.getElementById('budgetDaily').value === '' ? 0 : parseFloat(document.getElementById('budgetDaily').value);
+  if (isNaN(budget) || budget < 0 || isNaN(daily) || daily < 0) { showToast('Invalid amount'); return; }
+  await fetch(API + '/budget', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ key, budget_limit_usd: budget, daily_limit_usd: daily }) });
+  hideBudgetModal(); showToast('Limits saved'); loadKeys();
+}
+
+// ── Toast ──
+let toastTimer;
+function showToast(msg) {
+  const t = document.getElementById('toast'); t.textContent = msg; t.classList.add('show');
+  clearTimeout(toastTimer); toastTimer = setTimeout(() => t.classList.remove('show'), 3000);
+}
+
+// ── Modal close handlers ──
+document.getElementById('addModal').addEventListener('click', e => { if (e.target === e.currentTarget) hideAddModal(); });
+document.getElementById('budgetModal').addEventListener('click', e => { if (e.target === e.currentTarget) hideBudgetModal(); });
+document.getElementById('addTokenModal').addEventListener('click', e => { if (e.target === e.currentTarget) hideAddTokenModal(); });
+document.addEventListener('keydown', e => { if (e.key === 'Escape') { hideAddModal(); hideBudgetModal(); hideAddTokenModal(); } });
+
+checkSession();
+</script>
+</body>
+</html>

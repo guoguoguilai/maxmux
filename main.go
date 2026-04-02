@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/rand"
 	"database/sql"
+	_ "embed"
 	"encoding/hex"
 	"encoding/json"
 	"flag"
@@ -32,6 +33,7 @@ type VirtualKeyConfig struct {
 	Key             string  `yaml:"key" json:"key"`
 	BudgetLimitUSD  float64 `yaml:"budget_limit_usd,omitempty" json:"budget_limit_usd"`
 	DailyLimitUSD   float64 `yaml:"daily_limit_usd,omitempty" json:"daily_limit_usd"`
+	Disabled        bool    `yaml:"disabled,omitempty" json:"disabled"`
 }
 
 type AdminConfig struct {
@@ -40,11 +42,12 @@ type AdminConfig struct {
 }
 
 type Config struct {
-	Port       int             `yaml:"port"`
-	Upstream   string          `yaml:"upstream"`
-	OAuthToken string          `yaml:"oauth_token"`
-	Admin      AdminConfig     `yaml:"admin"`
-	SeedKeys   []VirtualKeyConfig `yaml:"virtual_keys"`
+	Port        int                `yaml:"port"`
+	Upstream    string             `yaml:"upstream"`
+	OAuthToken  string             `yaml:"oauth_token"`
+	OAuthTokens []string           `yaml:"oauth_tokens"`
+	Admin       AdminConfig        `yaml:"admin"`
+	SeedKeys    []VirtualKeyConfig `yaml:"virtual_keys"`
 }
 
 // UsageRecord stores a single request's usage data with timestamp.
@@ -143,6 +146,21 @@ func (s *Store) migrate() error {
 	// Migration: add columns if missing (for existing databases).
 	s.db.Exec("ALTER TABLE virtual_keys ADD COLUMN budget_limit_usd REAL NOT NULL DEFAULT 0")
 	s.db.Exec("ALTER TABLE virtual_keys ADD COLUMN daily_limit_usd REAL NOT NULL DEFAULT 0")
+	s.db.Exec("ALTER TABLE virtual_keys ADD COLUMN disabled INTEGER NOT NULL DEFAULT 0")
+
+	// OAuth tokens table for multi-token support.
+	_, err2 := s.db.Exec(`
+		CREATE TABLE IF NOT EXISTS oauth_tokens (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			token TEXT NOT NULL UNIQUE,
+			name TEXT NOT NULL DEFAULT '',
+			disabled INTEGER NOT NULL DEFAULT 0,
+			sort_order INTEGER NOT NULL DEFAULT 0
+		)
+	`)
+	if err2 != nil {
+		return err2
+	}
 	return nil
 }
 
@@ -172,7 +190,7 @@ func (s *Store) SetConfig(key, value string) error {
 // --- Virtual keys ---
 
 func (s *Store) ListKeys() ([]VirtualKeyConfig, error) {
-	rows, err := s.db.Query("SELECT key, name, budget_limit_usd, daily_limit_usd FROM virtual_keys ORDER BY name")
+	rows, err := s.db.Query("SELECT key, name, budget_limit_usd, daily_limit_usd, disabled FROM virtual_keys ORDER BY name")
 	if err != nil {
 		return nil, err
 	}
@@ -180,9 +198,11 @@ func (s *Store) ListKeys() ([]VirtualKeyConfig, error) {
 	var keys []VirtualKeyConfig
 	for rows.Next() {
 		var k VirtualKeyConfig
-		if err := rows.Scan(&k.Key, &k.Name, &k.BudgetLimitUSD, &k.DailyLimitUSD); err != nil {
+		var disabled int
+		if err := rows.Scan(&k.Key, &k.Name, &k.BudgetLimitUSD, &k.DailyLimitUSD, &disabled); err != nil {
 			return nil, err
 		}
+		k.Disabled = disabled != 0
 		keys = append(keys, k)
 	}
 	return keys, rows.Err()
@@ -229,6 +249,68 @@ func (s *Store) GetDailyLimit(key string) float64 {
 	var limit float64
 	s.db.QueryRow("SELECT daily_limit_usd FROM virtual_keys WHERE key = ?", key).Scan(&limit)
 	return limit
+}
+
+func (s *Store) SetDisabled(key string, disabled bool) error {
+	v := 0
+	if disabled {
+		v = 1
+	}
+	_, err := s.db.Exec("UPDATE virtual_keys SET disabled = ? WHERE key = ?", v, key)
+	return err
+}
+
+// --- OAuth tokens ---
+
+type OAuthTokenEntry struct {
+	ID        int    `json:"id"`
+	Token     string `json:"token"`
+	Name      string `json:"name"`
+	Disabled  bool   `json:"disabled"`
+	SortOrder int    `json:"sort_order"`
+}
+
+func (s *Store) ListOAuthTokens() ([]OAuthTokenEntry, error) {
+	rows, err := s.db.Query("SELECT id, token, name, disabled, sort_order FROM oauth_tokens ORDER BY sort_order, id")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var tokens []OAuthTokenEntry
+	for rows.Next() {
+		var t OAuthTokenEntry
+		var disabled int
+		if err := rows.Scan(&t.ID, &t.Token, &t.Name, &disabled, &t.SortOrder); err != nil {
+			return nil, err
+		}
+		t.Disabled = disabled != 0
+		tokens = append(tokens, t)
+	}
+	return tokens, rows.Err()
+}
+
+func (s *Store) AddOAuthToken(token, name string) error {
+	var maxOrder int
+	s.db.QueryRow("SELECT COALESCE(MAX(sort_order), 0) FROM oauth_tokens").Scan(&maxOrder)
+	_, err := s.db.Exec(
+		"INSERT INTO oauth_tokens (token, name, sort_order) VALUES (?, ?, ?) ON CONFLICT(token) DO UPDATE SET name = excluded.name",
+		token, name, maxOrder+1,
+	)
+	return err
+}
+
+func (s *Store) RemoveOAuthToken(id int) error {
+	_, err := s.db.Exec("DELETE FROM oauth_tokens WHERE id = ?", id)
+	return err
+}
+
+func (s *Store) SetOAuthTokenDisabled(id int, disabled bool) error {
+	v := 0
+	if disabled {
+		v = 1
+	}
+	_, err := s.db.Exec("UPDATE oauth_tokens SET disabled = ? WHERE id = ?", v, id)
+	return err
 }
 
 // QueryKeyCostToday calculates the estimated cost for a key since midnight UTC today.
@@ -383,7 +465,7 @@ func (s *Store) QueryAll(from, to time.Time) (map[string]KeyStats, error) {
 	return result, rows.Err()
 }
 
-func (s *Store) QueryStats(from, to time.Time, key string) ([]StatsBucket, error) {
+func (s *Store) QueryStats(from, to time.Time, keys []string) ([]StatsBucket, error) {
 	// Choose bucket granularity based on range duration.
 	var bucketExpr string
 	if !from.IsZero() && !to.IsZero() {
@@ -412,13 +494,18 @@ func (s *Store) QueryStats(from, to time.Time, key string) ([]StatsBucket, error
 	}
 
 	where, args := timeRangeWhere(from, to)
-	if key != "" {
-		if where == "" {
-			where = "WHERE virtual_key = ?"
-		} else {
-			where += " AND virtual_key = ?"
+	if len(keys) > 0 {
+		placeholders := make([]string, len(keys))
+		for i, k := range keys {
+			placeholders[i] = "?"
+			args = append(args, k)
 		}
-		args = append(args, key)
+		inClause := "virtual_key IN (" + strings.Join(placeholders, ",") + ")"
+		if where == "" {
+			where = "WHERE " + inClause
+		} else {
+			where += " AND " + inClause
+		}
 	}
 
 	q := fmt.Sprintf(`SELECT %s as bucket,
@@ -462,6 +549,7 @@ type keyInfo struct {
 	name           string
 	budgetLimitUSD float64
 	dailyLimitUSD  float64
+	disabled       bool
 }
 
 // KeyManager provides a fast in-memory cache for key validation.
@@ -488,7 +576,7 @@ func (m *KeyManager) reload() error {
 	defer m.mu.Unlock()
 	m.keys = make(map[string]keyInfo, len(keys))
 	for _, k := range keys {
-		m.keys[k.Key] = keyInfo{name: k.Name, budgetLimitUSD: k.BudgetLimitUSD, dailyLimitUSD: k.DailyLimitUSD}
+		m.keys[k.Key] = keyInfo{name: k.Name, budgetLimitUSD: k.BudgetLimitUSD, dailyLimitUSD: k.DailyLimitUSD, disabled: k.Disabled}
 	}
 	return nil
 }
@@ -538,6 +626,25 @@ func (m *KeyManager) SetDailyLimit(key string, daily float64) error {
 	return nil
 }
 
+func (m *KeyManager) IsDisabled(key string) bool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.keys[key].disabled
+}
+
+func (m *KeyManager) SetDisabled(key string, disabled bool) error {
+	if err := m.store.SetDisabled(key, disabled); err != nil {
+		return err
+	}
+	m.mu.Lock()
+	if info, ok := m.keys[key]; ok {
+		info.disabled = disabled
+		m.keys[key] = info
+	}
+	m.mu.Unlock()
+	return nil
+}
+
 func (m *KeyManager) Add(name, key string) error {
 	if err := m.store.AddKey(name, key); err != nil {
 		return err
@@ -566,7 +673,7 @@ func (m *KeyManager) List() []VirtualKeyConfig {
 	defer m.mu.RUnlock()
 	result := make([]VirtualKeyConfig, 0, len(m.keys))
 	for k, info := range m.keys {
-		result = append(result, VirtualKeyConfig{Name: info.name, Key: k, BudgetLimitUSD: info.budgetLimitUSD, DailyLimitUSD: info.dailyLimitUSD})
+		result = append(result, VirtualKeyConfig{Name: info.name, Key: k, BudgetLimitUSD: info.budgetLimitUSD, DailyLimitUSD: info.dailyLimitUSD, Disabled: info.disabled})
 	}
 	return result
 }
@@ -813,6 +920,101 @@ func calcModelCost(model string, inputTokens, outputTokens, cacheWrite, cacheRea
 		float64(cacheRead)*inp*0.1) / 1_000_000
 }
 
+// TokenPool manages multiple OAuth tokens with automatic failover.
+// Uses the first enabled token by default; rotates to the next on 429/529 errors.
+type TokenPool struct {
+	mu      sync.RWMutex
+	tokens  []OAuthTokenEntry
+	current int // index into tokens
+	store   *Store
+	log     *zerolog.Logger
+}
+
+func NewTokenPool(store *Store, log *zerolog.Logger) *TokenPool {
+	tp := &TokenPool{store: store, log: log}
+	tp.Reload()
+	return tp
+}
+
+func (tp *TokenPool) Reload() {
+	tokens, err := tp.store.ListOAuthTokens()
+	if err != nil {
+		tp.log.Error().Err(err).Msg("failed to reload oauth tokens")
+		return
+	}
+	tp.mu.Lock()
+	defer tp.mu.Unlock()
+	tp.tokens = tokens
+	// Reset current to first enabled token.
+	tp.current = -1
+	for i, t := range tp.tokens {
+		if !t.Disabled {
+			tp.current = i
+			break
+		}
+	}
+}
+
+// Current returns the current active OAuth token string.
+func (tp *TokenPool) Current() string {
+	tp.mu.RLock()
+	defer tp.mu.RUnlock()
+	if tp.current >= 0 && tp.current < len(tp.tokens) {
+		return tp.tokens[tp.current].Token
+	}
+	return ""
+}
+
+// Rotate advances to the next enabled token. Returns true if a different token is now active.
+func (tp *TokenPool) Rotate() bool {
+	tp.mu.Lock()
+	defer tp.mu.Unlock()
+	if len(tp.tokens) <= 1 {
+		return false
+	}
+	start := tp.current
+	for i := 1; i < len(tp.tokens); i++ {
+		idx := (start + i) % len(tp.tokens)
+		if !tp.tokens[idx].Disabled {
+			tp.current = idx
+			tp.log.Warn().
+				Str("from", maskToken(tp.tokens[start].Token)).
+				Str("to", maskToken(tp.tokens[idx].Token)).
+				Str("name", tp.tokens[idx].Name).
+				Msg("rotated to next oauth token")
+			return true
+		}
+	}
+	return false // no other enabled token found
+}
+
+// Count returns total and enabled token counts.
+func (tp *TokenPool) Count() (total, enabled int) {
+	tp.mu.RLock()
+	defer tp.mu.RUnlock()
+	total = len(tp.tokens)
+	for _, t := range tp.tokens {
+		if !t.Disabled {
+			enabled++
+		}
+	}
+	return
+}
+
+// SetCurrent switches the active token to the one with the given ID.
+func (tp *TokenPool) SetCurrent(id int) bool {
+	tp.mu.Lock()
+	defer tp.mu.Unlock()
+	for i, t := range tp.tokens {
+		if t.ID == id {
+			tp.current = i
+			tp.log.Info().Int("id", id).Str("name", t.Name).Str("token", maskToken(t.Token)).Msg("manually switched active token")
+			return true
+		}
+	}
+	return false
+}
+
 type ctxStartKey struct{}
 
 func maskToken(t string) string {
@@ -847,9 +1049,6 @@ func main() {
 		log.Fatal().Err(err).Msg("failed to load config")
 	}
 
-	if cfg.OAuthToken == "" {
-		log.Fatal().Msg("oauth_token is required in config")
-	}
 	if cfg.Admin.Username == "" || cfg.Admin.Password == "" {
 		log.Fatal().Msg("admin username and password are required in config")
 	}
@@ -883,29 +1082,77 @@ func main() {
 	}
 	sessions := NewSessionStore(store)
 
-	// Load or initialize OAuth token.
+	// Initialize OAuth token pool.
+	// Seed tokens from config into the oauth_tokens table.
+	allConfigTokens := cfg.OAuthTokens
+	if cfg.OAuthToken != "" {
+		// Prepend the single token if not already in the list.
+		found := false
+		for _, t := range allConfigTokens {
+			if t == cfg.OAuthToken {
+				found = true
+				break
+			}
+		}
+		if !found {
+			allConfigTokens = append([]string{cfg.OAuthToken}, allConfigTokens...)
+		}
+	}
+	for i, t := range allConfigTokens {
+		name := fmt.Sprintf("Token %d", i+1)
+		store.AddOAuthToken(t, name)
+	}
+	// Migrate legacy single token from config table into oauth_tokens.
+	if legacyToken, _ := store.GetConfig("oauth_token"); legacyToken != "" {
+		existing, _ := store.ListOAuthTokens()
+		found := false
+		for _, e := range existing {
+			if e.Token == legacyToken {
+				found = true
+				break
+			}
+		}
+		if !found {
+			store.AddOAuthToken(legacyToken, "Legacy Token")
+		}
+	}
+	tokenPool := NewTokenPool(store, &log)
+	// Also keep atomic value for backward compat with single-token GET/PUT endpoints.
 	var oauthToken atomic.Value
-	savedToken, _ := store.GetConfig("oauth_token")
-	if savedToken != "" {
-		oauthToken.Store(savedToken)
-	} else {
+	if cur := tokenPool.Current(); cur != "" {
+		oauthToken.Store(cur)
+	} else if cfg.OAuthToken != "" {
 		oauthToken.Store(cfg.OAuthToken)
-		store.SetConfig("oauth_token", cfg.OAuthToken)
+	} else {
+		oauthToken.Store("")
 	}
 
 	upstream, err := url.Parse(cfg.Upstream)
 	if err != nil {
 		log.Fatal().Err(err).Str("upstream", cfg.Upstream).Msg("invalid upstream URL")
 	}
+	totalTokens, enabledTokens := tokenPool.Count()
+	currentToken := tokenPool.Current()
+	if currentToken == "" {
+		currentToken = oauthToken.Load().(string)
+	}
+	if currentToken == "" && totalTokens == 0 {
+		log.Warn().Msg("no oauth tokens configured — add tokens via admin UI or config file")
+	}
 	log.Info().
 		Int("port", cfg.Port).
 		Str("upstream", cfg.Upstream).
-		Str("oauth_token", maskToken(oauthToken.Load().(string))).
+		Int("oauth_tokens_total", totalTokens).
+		Int("oauth_tokens_enabled", enabledTokens).
+		Str("active_token", maskToken(currentToken)).
 		Msg("starting maxmux")
 
 	proxy := &httputil.ReverseProxy{
 		Director: func(req *http.Request) {
-			token := oauthToken.Load().(string)
+			token := tokenPool.Current()
+			if token == "" {
+				token = oauthToken.Load().(string)
+			}
 			req.URL.Scheme = upstream.Scheme
 			req.URL.Host = upstream.Host
 			req.Host = upstream.Host
@@ -967,7 +1214,11 @@ func main() {
 
 				model, inputTokens, outputTokens, cacheCreation, cacheRead := extractFromBody(body)
 				reqStart, _ := resp.Request.Context().Value(ctxStartKey{}).(time.Time)
-				if resp.StatusCode == http.StatusTooManyRequests {
+				if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode == 529 {
+					// Try rotating to the next OAuth token.
+					if tokenPool.Rotate() {
+						log.Warn().Int("status", resp.StatusCode).Msg("upstream rate limited — rotated to next token")
+					}
 					// Strip retry headers so the SDK does not back-off and retry endlessly.
 					resp.Header.Del("Retry-After")
 					resp.Header.Del("X-Ratelimit-Reset-Requests")
@@ -1121,6 +1372,7 @@ func main() {
 				Name                     string                    `json:"name"`
 				Key                      string                    `json:"key"`
 				MaskedKey                string                    `json:"masked_key"`
+				Disabled                 bool                      `json:"disabled"`
 				RequestCount             int64                     `json:"request_count"`
 				InputTokens              int64                     `json:"input_tokens"`
 				OutputTokens             int64                     `json:"output_tokens"`
@@ -1170,6 +1422,7 @@ func main() {
 					Name:                     k.Name,
 					Key:                      k.Key,
 					MaskedKey:                maskToken(k.Key),
+					Disabled:                 k.Disabled,
 					RequestCount:             u.RequestCount,
 					InputTokens:              u.InputTokens,
 					OutputTokens:             u.OutputTokens,
@@ -1249,8 +1502,8 @@ func main() {
 				return
 			}
 			from, to := parseTimeRange(r)
-			key := r.URL.Query().Get("key")
-			buckets, err := store.QueryStats(from, to, key)
+			keys := r.URL.Query()["keys"]
+			buckets, err := store.QueryStats(from, to, keys)
 			if err != nil {
 				log.Error().Err(err).Msg("failed to query stats")
 				writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
@@ -1282,7 +1535,7 @@ func main() {
 			return
 		}
 
-		// Update OAuth token.
+		// Update OAuth token (legacy single-token endpoint — adds to pool).
 		if r.URL.Path == "/admin/api/token" && r.Method == http.MethodPut {
 			if !requireAdmin(w, r) {
 				return
@@ -1302,6 +1555,9 @@ func main() {
 			if err := store.SetConfig("oauth_token", req.Token); err != nil {
 				log.Error().Err(err).Msg("failed to save token")
 			}
+			// Also add to token pool.
+			store.AddOAuthToken(req.Token, "Token (via settings)")
+			tokenPool.Reload()
 			log.Info().Str("token", maskToken(req.Token)).Msg("oauth token updated")
 			writeJSON(w, http.StatusOK, map[string]string{"status": "ok", "masked_token": maskToken(req.Token)})
 			return
@@ -1344,6 +1600,167 @@ func main() {
 			return
 		}
 
+		// Disable/enable a key.
+		if r.URL.Path == "/admin/api/keys/disable" && r.Method == http.MethodPut {
+			if !requireAdmin(w, r) {
+				return
+			}
+			var req struct {
+				Key      string `json:"key"`
+				Disabled bool   `json:"disabled"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request"})
+				return
+			}
+			if req.Key == "" {
+				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "key is required"})
+				return
+			}
+			if err := keyMgr.SetDisabled(req.Key, req.Disabled); err != nil {
+				log.Error().Err(err).Msg("failed to set disabled")
+				writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
+				return
+			}
+			action := "enabled"
+			if req.Disabled {
+				action = "disabled"
+			}
+			log.Info().Str("key", maskToken(req.Key)).Str("action", action).Msg("key status changed")
+			writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+			return
+		}
+
+		// --- OAuth tokens management ---
+		if r.URL.Path == "/admin/api/tokens" && r.Method == http.MethodGet {
+			if !requireAdmin(w, r) {
+				return
+			}
+			tokens, err := store.ListOAuthTokens()
+			if err != nil {
+				log.Error().Err(err).Msg("failed to list tokens")
+				writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
+				return
+			}
+			// Mask token values in response.
+			type maskedToken struct {
+				ID        int    `json:"id"`
+				Name      string `json:"name"`
+				Masked    string `json:"masked_token"`
+				Disabled  bool   `json:"disabled"`
+				SortOrder int    `json:"sort_order"`
+				Active    bool   `json:"active"`
+			}
+			activeToken := tokenPool.Current()
+			result := make([]maskedToken, len(tokens))
+			for i, t := range tokens {
+				result[i] = maskedToken{
+					ID:        t.ID,
+					Name:      t.Name,
+					Masked:    maskToken(t.Token),
+					Disabled:  t.Disabled,
+					SortOrder: t.SortOrder,
+					Active:    t.Token == activeToken,
+				}
+			}
+			writeJSON(w, http.StatusOK, result)
+			return
+		}
+
+		if r.URL.Path == "/admin/api/tokens" && r.Method == http.MethodPost {
+			if !requireAdmin(w, r) {
+				return
+			}
+			var req struct {
+				Token string `json:"token"`
+				Name  string `json:"name"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request"})
+				return
+			}
+			if req.Token == "" {
+				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "token is required"})
+				return
+			}
+			if req.Name == "" {
+				req.Name = maskToken(req.Token)
+			}
+			if err := store.AddOAuthToken(req.Token, req.Name); err != nil {
+				log.Error().Err(err).Msg("failed to add token")
+				writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
+				return
+			}
+			tokenPool.Reload()
+			log.Info().Str("name", req.Name).Str("token", maskToken(req.Token)).Msg("oauth token added")
+			writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+			return
+		}
+
+		if r.URL.Path == "/admin/api/tokens" && r.Method == http.MethodDelete {
+			if !requireAdmin(w, r) {
+				return
+			}
+			var req struct {
+				ID int `json:"id"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request"})
+				return
+			}
+			if err := store.RemoveOAuthToken(req.ID); err != nil {
+				log.Error().Err(err).Msg("failed to remove token")
+				writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
+				return
+			}
+			tokenPool.Reload()
+			log.Info().Int("id", req.ID).Msg("oauth token removed")
+			writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+			return
+		}
+
+		if r.URL.Path == "/admin/api/tokens/disable" && r.Method == http.MethodPut {
+			if !requireAdmin(w, r) {
+				return
+			}
+			var req struct {
+				ID       int  `json:"id"`
+				Disabled bool `json:"disabled"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request"})
+				return
+			}
+			if err := store.SetOAuthTokenDisabled(req.ID, req.Disabled); err != nil {
+				log.Error().Err(err).Msg("failed to set token disabled")
+				writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
+				return
+			}
+			tokenPool.Reload()
+			writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+			return
+		}
+
+		// Manually switch active token.
+		if r.URL.Path == "/admin/api/tokens/switch" && r.Method == http.MethodPut {
+			if !requireAdmin(w, r) {
+				return
+			}
+			var req struct {
+				ID int `json:"id"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request"})
+				return
+			}
+			if !tokenPool.SetCurrent(req.ID) {
+				writeJSON(w, http.StatusNotFound, map[string]string{"error": "token not found"})
+				return
+			}
+			writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+			return
+		}
+
 		// --- Balance API (for cc-switch etc.) ---
 		if r.URL.Path == "/user/balance" && r.Method == http.MethodGet {
 			var vk string
@@ -1354,6 +1771,13 @@ func main() {
 				writeJSON(w, http.StatusOK, map[string]any{
 					"is_active":      false,
 					"invalidMessage": "invalid virtual key",
+				})
+				return
+			}
+			if keyMgr.IsDisabled(vk) {
+				writeJSON(w, http.StatusOK, map[string]any{
+					"is_active":      false,
+					"invalidMessage": "this key has been disabled by the administrator",
 				})
 				return
 			}
@@ -1424,6 +1848,14 @@ func main() {
 			return
 		}
 
+		if keyMgr.IsDisabled(virtualKey) {
+			log.Warn().
+				Str("key", maskToken(virtualKey)).
+				Msg("rejected — key is disabled")
+			http.Error(w, `{"error":{"message":"this key has been disabled by the administrator","type":"authentication_error"}}`, http.StatusForbidden)
+			return
+		}
+
 		// Check budget limit.
 		if budget := keyMgr.GetBudget(virtualKey); budget > 0 {
 			cost, err := store.QueryKeyCost(virtualKey)
@@ -1478,945 +1910,6 @@ func main() {
 	}
 }
 
-const adminHTML = `<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Maxmux Admin</title>
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Fira+Code:wght@400;500;600&family=Fira+Sans:wght@300;400;500;600&display=swap" rel="stylesheet">
-<style>
-  * { margin: 0; padding: 0; box-sizing: border-box; }
-  body { font-family: 'Fira Sans', -apple-system, BlinkMacSystemFont, sans-serif; background: #0d1117; color: #e6edf3; min-height: 100vh; font-size: 14px; }
 
-  /* ── Login ── */
-  .login-container { display: flex; justify-content: center; align-items: center; min-height: 100vh; background: #0d1117; }
-  .login-box { background: #161b22; border: 1px solid #30363d; padding: 40px; border-radius: 12px; width: 360px; }
-  .login-logo { font-family: 'Fira Code', monospace; font-size: 22px; font-weight: 600; color: #58a6ff; margin-bottom: 6px; letter-spacing: -0.5px; }
-  .login-sub { color: #8b949e; margin-bottom: 28px; font-size: 13px; }
-  .form-group { margin-bottom: 16px; }
-  .form-group label { display: block; font-size: 12px; font-weight: 500; margin-bottom: 6px; color: #8b949e; text-transform: uppercase; letter-spacing: 0.05em; }
-  .form-group input { width: 100%; padding: 9px 12px; background: #0d1117; border: 1px solid #30363d; border-radius: 6px; font-size: 14px; color: #e6edf3; outline: none; transition: border-color 0.15s; font-family: inherit; }
-  .form-group input:focus { border-color: #58a6ff; box-shadow: 0 0 0 3px rgba(88,166,255,0.1); }
-  .btn { padding: 8px 16px; border: none; border-radius: 6px; font-size: 13px; font-weight: 500; cursor: pointer; transition: all 0.15s; font-family: inherit; white-space: nowrap; }
-  .btn-primary { background: #238636; color: #fff; }
-  .btn-primary:hover { background: #2ea043; }
-  .btn-blue { background: #1f6feb; color: #fff; }
-  .btn-blue:hover { background: #388bfd; }
-  .btn-danger { background: #da3633; color: #fff; }
-  .btn-danger:hover { background: #f85149; }
-  .btn-secondary { background: #21262d; color: #c9d1d9; border: 1px solid #30363d; }
-  .btn-secondary:hover { background: #30363d; }
-  .btn-sm { padding: 5px 10px; font-size: 12px; }
-  .btn-login { width: 100%; padding: 10px; font-size: 14px; margin-top: 4px; }
-  .error-msg { color: #f85149; font-size: 12px; margin-top: 10px; display: none; background: rgba(248,81,73,0.1); padding: 8px 12px; border-radius: 6px; border: 1px solid rgba(248,81,73,0.2); }
-
-  /* ── Layout ── */
-  .dashboard { display: none; }
-  .header { background: #161b22; border-bottom: 1px solid #21262d; padding: 12px 24px; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 10px; position: sticky; top: 0; z-index: 50; }
-  .header-left { display: flex; align-items: center; gap: 16px; }
-  .header-logo { font-family: 'Fira Code', monospace; font-size: 16px; font-weight: 600; color: #58a6ff; letter-spacing: -0.5px; }
-  .header-right { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
-  .content { max-width: 1280px; margin: 24px auto; padding: 0 24px; }
-
-  /* ── Time filter ── */
-  .time-filter { display: flex; gap: 4px; align-items: center; flex-wrap: wrap; }
-  .time-filter button { padding: 4px 10px; border: 1px solid #30363d; border-radius: 6px; background: transparent; font-size: 12px; cursor: pointer; color: #8b949e; transition: all 0.15s; font-family: 'Fira Code', monospace; }
-  .time-filter button:hover { background: #21262d; color: #e6edf3; border-color: #58a6ff; }
-  .time-filter button.active { background: #1f6feb; color: #fff; border-color: #1f6feb; }
-  .datetime-range { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; margin-top: 6px; }
-  .datetime-range label { font-size: 11px; color: #8b949e; text-transform: uppercase; letter-spacing: 0.05em; }
-  .datetime-range input[type="datetime-local"] { padding: 4px 8px; background: #0d1117; border: 1px solid #30363d; border-radius: 6px; font-size: 12px; color: #e6edf3; font-family: 'Fira Code', monospace; outline: none; color-scheme: dark; }
-  .datetime-range input[type="datetime-local"]:focus { border-color: #58a6ff; }
-
-  /* ── Charts ── */
-  .charts-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-bottom: 16px; }
-  .chart-card { background: #161b22; border: 1px solid #21262d; border-radius: 8px; padding: 20px; }
-  .chart-card-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; }
-  .chart-card-header h3 { font-size: 13px; font-weight: 600; color: #e6edf3; }
-  .chart-select { padding: 4px 8px; background: #0d1117; border: 1px solid #30363d; border-radius: 6px; font-size: 12px; color: #e6edf3; font-family: inherit; outline: none; cursor: pointer; }
-  .chart-select:focus { border-color: #58a6ff; }
-  .chart-canvas { width: 100%; height: 200px; display: block; }
-  .chart-legend { display: flex; gap: 12px; margin-top: 8px; flex-wrap: wrap; }
-  .legend-item { display: flex; align-items: center; gap: 4px; font-size: 11px; color: #8b949e; }
-  .legend-dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; flex-shrink: 0; }
-
-  /* ── Stats ── */
-  .stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin-bottom: 16px; }
-  .stat-card { background: #161b22; border: 1px solid #21262d; padding: 16px 20px; border-radius: 8px; }
-  .stat-card .label { font-size: 11px; color: #8b949e; margin-bottom: 6px; text-transform: uppercase; letter-spacing: 0.05em; }
-  .stat-card .value { font-size: 24px; font-weight: 600; font-family: 'Fira Code', monospace; color: #e6edf3; }
-  .stat-card .value.cost { color: #3fb950; }
-  .stat-card .value.savings { color: #58a6ff; }
-
-  /* ── Section / Table ── */
-  .section { background: #161b22; border: 1px solid #21262d; border-radius: 8px; padding: 20px; margin-bottom: 16px; }
-  .section-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; }
-  .section-header h2 { font-size: 14px; font-weight: 600; color: #e6edf3; }
-  .section-actions { display: flex; gap: 8px; align-items: center; }
-  table { width: 100%; border-collapse: collapse; }
-  th { text-align: left; padding: 8px 12px; font-size: 11px; font-weight: 500; color: #8b949e; text-transform: uppercase; letter-spacing: 0.05em; border-bottom: 1px solid #21262d; }
-  td { padding: 12px 12px; border-bottom: 1px solid #161b22; font-size: 13px; vertical-align: middle; }
-  tr:hover td { background: #1c2128; }
-  tr:last-child td { border-bottom: none; }
-  .mono { font-family: 'Fira Code', monospace; font-size: 12px; color: #8b949e; }
-  .cost-cell { color: #3fb950; font-weight: 500; font-family: 'Fira Code', monospace; }
-  .name-cell { font-weight: 500; color: #e6edf3; }
-  .model-detail { font-size: 11px; color: #6e7681; margin-top: 3px; }
-  .model-detail span { margin-right: 8px; }
-
-  /* ── Budget bar ── */
-  .budget-wrap { min-width: 120px; }
-  .budget-nums { font-size: 12px; font-family: 'Fira Code', monospace; margin-bottom: 4px; display: flex; justify-content: space-between; align-items: baseline; gap: 6px; }
-  .budget-bar-bg { background: #21262d; border-radius: 3px; height: 4px; overflow: hidden; }
-  .budget-bar-fill { height: 4px; border-radius: 3px; transition: width 0.3s; }
-  .budget-label { font-size: 11px; color: #6e7681; margin-top: 3px; }
-  .limit-edit { font-size: 11px; color: #58a6ff; text-decoration: none; cursor: pointer; background: none; border: none; padding: 0; font-family: inherit; }
-  .limit-edit:hover { text-decoration: underline; }
-
-  /* ── Tag / badge ── */
-  .tag { display: inline-block; padding: 2px 7px; border-radius: 4px; font-size: 11px; font-weight: 500; }
-  .tag-green { background: rgba(63,185,80,0.15); color: #3fb950; }
-  .tag-yellow { background: rgba(210,153,34,0.15); color: #d29922; }
-  .tag-red { background: rgba(248,81,73,0.15); color: #f85149; }
-  .tag-gray { background: rgba(110,118,129,0.15); color: #6e7681; }
-
-  /* ── Modal ── */
-  .modal-overlay { display: none; position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,0.6); z-index: 200; justify-content: center; align-items: center; }
-  .modal-overlay.active { display: flex; }
-  .modal { background: #161b22; border: 1px solid #30363d; padding: 28px; border-radius: 10px; width: 420px; box-shadow: 0 16px 48px rgba(0,0,0,0.5); }
-  .modal h2 { margin-bottom: 20px; font-size: 16px; color: #e6edf3; }
-  .modal .form-group { margin-bottom: 14px; }
-  .modal .form-group:last-of-type { margin-bottom: 20px; }
-  .modal-actions { display: flex; gap: 8px; justify-content: flex-end; }
-  .modal-hint { font-size: 12px; color: #6e7681; margin-top: 5px; }
-  .input-row { display: flex; gap: 8px; }
-  .input-row input { flex: 1; }
-
-  /* ── Settings ── */
-  .settings-row { display: flex; gap: 8px; align-items: center; }
-  .settings-row input { flex: 1; padding: 8px 12px; background: #0d1117; border: 1px solid #30363d; border-radius: 6px; font-size: 13px; color: #e6edf3; font-family: 'Fira Code', monospace; outline: none; }
-  .settings-row input:focus { border-color: #58a6ff; }
-  .token-current { font-size: 12px; color: #6e7681; margin-top: 6px; }
-  .token-current span { color: #8b949e; font-family: 'Fira Code', monospace; }
-
-  /* ── Toast ── */
-  .toast { position: fixed; bottom: 24px; right: 24px; background: #1f2937; border: 1px solid #374151; color: #e6edf3; padding: 10px 16px; border-radius: 8px; font-size: 13px; z-index: 999; opacity: 0; transform: translateY(8px); transition: all 0.2s; pointer-events: none; }
-  .toast.show { opacity: 1; transform: translateY(0); }
-
-  .token-num { font-variant-numeric: tabular-nums; }
-
-  @media (max-width: 900px) {
-    .stats { grid-template-columns: repeat(2, 1fr); }
-    .charts-grid { grid-template-columns: 1fr; }
-    .content { padding: 0 16px; }
-    th, td { padding: 8px; font-size: 12px; }
-  }
-  @media (max-width: 500px) {
-    .stats { grid-template-columns: 1fr 1fr; }
-    .modal { width: calc(100vw - 32px); }
-  }
-</style>
-</head>
-<body>
-
-<div class="login-container" id="loginPage">
-  <div class="login-box">
-    <div class="login-logo">maxmux</div>
-    <div class="login-sub">Admin Dashboard</div>
-    <div class="form-group">
-      <label>Username</label>
-      <input type="text" id="username" autocomplete="username">
-    </div>
-    <div class="form-group">
-      <label>Password</label>
-      <input type="password" id="password" autocomplete="current-password">
-    </div>
-    <button class="btn btn-blue btn-login" onclick="login()">Sign In</button>
-    <div class="error-msg" id="loginError">Invalid username or password</div>
-  </div>
-</div>
-
-<div class="dashboard" id="dashboard">
-  <div class="header">
-    <div class="header-left">
-      <span class="header-logo">maxmux</span>
-      <div class="time-filter" id="timeFilter">
-        <button data-preset="5m" onclick="setPreset(this)">5m</button>
-        <button data-preset="1h" onclick="setPreset(this)">1h</button>
-        <button data-preset="1d" onclick="setPreset(this)">1d</button>
-        <button data-preset="7d" onclick="setPreset(this)">7d</button>
-        <button data-preset="30d" onclick="setPreset(this)">30d</button>
-        <button data-preset="all" class="active" onclick="setPreset(this)">All</button>
-      </div>
-      <div class="datetime-range">
-        <label>From</label>
-        <input type="datetime-local" id="dtFrom" onchange="applyDateRange()">
-        <label>To</label>
-        <input type="datetime-local" id="dtTo" onchange="applyDateRange()">
-      </div>
-    </div>
-    <div class="header-right">
-      <button class="btn btn-secondary btn-sm" onclick="logout()">Sign Out</button>
-    </div>
-  </div>
-  <div class="content">
-    <div class="stats">
-      <div class="stat-card">
-        <div class="label">Requests</div>
-        <div class="value token-num" id="totalRequests">0</div>
-      </div>
-      <div class="stat-card">
-        <div class="label">Input Tokens</div>
-        <div class="value token-num" id="totalInput">0</div>
-      </div>
-      <div class="stat-card">
-        <div class="label">Output Tokens</div>
-        <div class="value token-num" id="totalOutput">0</div>
-      </div>
-      <div class="stat-card">
-        <div class="label">Est. Cost</div>
-        <div class="value cost token-num" id="totalCost">$0.00</div>
-      </div>
-    </div>
-    <div class="stats">
-      <div class="stat-card">
-        <div class="label">Cache Write</div>
-        <div class="value token-num" id="totalCacheWrite">0</div>
-      </div>
-      <div class="stat-card">
-        <div class="label">Cache Read</div>
-        <div class="value token-num" id="totalCacheRead">0</div>
-      </div>
-      <div class="stat-card">
-        <div class="label">Cache Hit Rate</div>
-        <div class="value token-num" id="cacheHitRate">—</div>
-      </div>
-      <div class="stat-card">
-        <div class="label">Cache Savings</div>
-        <div class="value savings token-num" id="cacheSavings">$0.00</div>
-      </div>
-    </div>
-    <div class="charts-grid">
-      <div class="chart-card">
-        <div class="chart-card-header">
-          <span>Requests &amp; Cost Over Time</span>
-          <select class="chart-select" id="keyFilter" onchange="loadStats()">
-            <option value="">All Keys</option>
-          </select>
-        </div>
-        <canvas class="chart-canvas" id="timeseriesChart"></canvas>
-      </div>
-      <div class="chart-card">
-        <div class="chart-card-header">
-          <span>Cost by Key</span>
-        </div>
-        <canvas class="chart-canvas" id="distributionChart"></canvas>
-        <div class="chart-legend" id="distributionLegend"></div>
-      </div>
-    </div>
-    <div class="section">
-      <div class="section-header">
-        <h2>Virtual Keys</h2>
-        <div class="section-actions">
-          <label class="btn btn-secondary btn-sm" style="cursor:pointer">Import CSV<input type="file" accept=".csv,.txt" style="display:none" onchange="importCSV(this)"></label>
-          <button class="btn btn-blue btn-sm" onclick="showAddModal()">+ Add Key</button>
-        </div>
-      </div>
-      <table>
-        <thead>
-          <tr>
-            <th>Name</th>
-            <th>Key</th>
-            <th>Requests</th>
-            <th>Input</th>
-            <th>Output</th>
-            <th>Est. Cost</th>
-            <th>Total Budget</th>
-            <th>Daily Budget</th>
-            <th>Last Active</th>
-            <th></th>
-          </tr>
-        </thead>
-        <tbody id="keysTable"></tbody>
-      </table>
-    </div>
-    <div class="section">
-      <div class="section-header"><h2>Settings</h2></div>
-      <div class="form-group" style="max-width:480px">
-        <label>OAuth Token</label>
-        <div class="settings-row">
-          <input type="password" id="tokenInput" placeholder="Paste new token">
-          <button class="btn btn-secondary btn-sm" onclick="toggleTokenVisibility()">Show</button>
-          <button class="btn btn-blue btn-sm" onclick="updateToken()">Save</button>
-        </div>
-        <div class="token-current">Current: <span id="currentToken">—</span></div>
-      </div>
-    </div>
-  </div>
-</div>
-
-<!-- Add Key Modal -->
-<div class="modal-overlay" id="addModal">
-  <div class="modal">
-    <h2>Add Virtual Key</h2>
-    <div class="form-group">
-      <label>Name</label>
-      <input type="text" id="newName" placeholder="e.g. Alice">
-    </div>
-    <div class="form-group">
-      <label>Key</label>
-      <input type="text" id="newKey" placeholder="e.g. sk-ant-...">
-    </div>
-    <div class="modal-actions">
-      <button class="btn btn-secondary" onclick="hideAddModal()">Cancel</button>
-      <button class="btn btn-blue" onclick="addKey()">Add Key</button>
-    </div>
-  </div>
-</div>
-
-<!-- Budget Modal -->
-<div class="modal-overlay" id="budgetModal">
-  <div class="modal">
-    <h2 id="budgetModalTitle">Set Limits</h2>
-    <input type="hidden" id="budgetKey">
-    <div class="form-group">
-      <label>Total Budget (USD)</label>
-      <input type="number" id="budgetTotal" placeholder="0 = unlimited" min="0" step="0.01">
-      <div class="modal-hint">Cumulative all-time spending cap. 0 = no limit.</div>
-    </div>
-    <div class="form-group">
-      <label>Daily Limit (USD)</label>
-      <input type="number" id="budgetDaily" placeholder="0 = unlimited" min="0" step="0.01">
-      <div class="modal-hint">Resets at midnight UTC each day. 0 = no limit.</div>
-    </div>
-    <div class="modal-actions">
-      <button class="btn btn-secondary" onclick="hideBudgetModal()">Cancel</button>
-      <button class="btn btn-blue" onclick="saveBudget()">Save</button>
-    </div>
-  </div>
-</div>
-
-<div class="toast" id="toast"></div>
-
-<script>
-const API = '/admin/api';
-let refreshTimer;
-let currentFrom = ''; // ISO string or ''
-let currentTo = '';   // ISO string or ''
-
-
-function formatCost(cost) {
-  if (cost < 0.01) return '$' + cost.toFixed(4);
-  return '$' + cost.toFixed(2);
-}
-
-function formatNumber(n) {
-  return n.toLocaleString();
-}
-
-function formatRelTime(iso) {
-  if (!iso) return '—';
-  const d = new Date(iso);
-  const diff = Math.floor((Date.now() - d.getTime()) / 1000);
-  if (diff < 60) return diff + 's ago';
-  if (diff < 3600) return Math.floor(diff / 60) + 'm ago';
-  if (diff < 86400) return Math.floor(diff / 3600) + 'h ago';
-  return Math.floor(diff / 86400) + 'd ago';
-}
-
-function toDatetimeLocal(d) {
-  // Convert Date to datetime-local string (local time, no seconds)
-  const pad = n => String(n).padStart(2, '0');
-  return d.getFullYear() + '-' + pad(d.getMonth()+1) + '-' + pad(d.getDate()) +
-         'T' + pad(d.getHours()) + ':' + pad(d.getMinutes());
-}
-
-function fromDatetimeLocal(s) {
-  return s ? new Date(s).toISOString() : '';
-}
-
-function buildRangeParams() {
-  const p = new URLSearchParams();
-  if (currentFrom) p.set('from', currentFrom);
-  if (currentTo) p.set('to', currentTo);
-  return p.toString() ? '?' + p.toString() : '';
-}
-
-function setPreset(el) {
-  document.querySelectorAll('.time-filter button[data-preset]').forEach(b => b.classList.remove('active'));
-  el.classList.add('active');
-  const preset = el.dataset.preset;
-  const now = new Date();
-  let from = null;
-  if (preset === '5m')  from = new Date(now - 5*60*1000);
-  else if (preset === '1h')  from = new Date(now - 60*60*1000);
-  else if (preset === '1d')  from = new Date(now - 24*60*60*1000);
-  else if (preset === '7d')  from = new Date(now - 7*24*60*60*1000);
-  else if (preset === '30d') from = new Date(now - 30*24*60*60*1000);
-  // 'all' => from = null
-  currentFrom = from ? from.toISOString() : '';
-  currentTo = '';
-  document.getElementById('dtFrom').value = from ? toDatetimeLocal(from) : '';
-  document.getElementById('dtTo').value = '';
-  loadAll();
-}
-
-function applyDateRange() {
-  const fromStr = document.getElementById('dtFrom').value;
-  const toStr = document.getElementById('dtTo').value;
-  currentFrom = fromDatetimeLocal(fromStr);
-  currentTo = fromDatetimeLocal(toStr);
-  // Deselect preset buttons
-  document.querySelectorAll('.time-filter button[data-preset]').forEach(b => b.classList.remove('active'));
-  loadAll();
-}
-
-function loadAll() {
-  loadKeys();
-  loadStats();
-}
-
-async function login() {
-  const username = document.getElementById('username').value;
-  const password = document.getElementById('password').value;
-  const res = await fetch(API + '/login', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ username, password })
-  });
-  if (res.ok) {
-    showDashboard();
-  } else {
-    const el = document.getElementById('loginError');
-    el.style.display = 'block';
-    setTimeout(() => el.style.display = 'none', 3000);
-  }
-}
-
-document.getElementById('password').addEventListener('keydown', e => { if (e.key === 'Enter') login(); });
-document.getElementById('username').addEventListener('keydown', e => { if (e.key === 'Enter') document.getElementById('password').focus(); });
-
-async function logout() {
-  await fetch(API + '/logout', { method: 'POST' });
-  document.getElementById('dashboard').style.display = 'none';
-  document.getElementById('loginPage').style.display = 'flex';
-  clearInterval(refreshTimer);
-}
-
-async function checkSession() {
-  for (let i = 0; i < 3; i++) {
-    try {
-      const res = await fetch(API + '/session');
-      if (res.ok) { showDashboard(); return; }
-      if (res.status === 401) return; // definitively not logged in
-    } catch(e) { /* network error, retry */ }
-    await new Promise(r => setTimeout(r, 500));
-  }
-}
-
-function showDashboard() {
-  if (refreshTimer) clearInterval(refreshTimer);
-  document.getElementById('loginPage').style.display = 'none';
-  document.getElementById('dashboard').style.display = 'block';
-  loadAll();
-  loadToken();
-  refreshTimer = setInterval(loadAll, 30000);
-}
-
-async function loadKeys() {
-  const url = API + '/keys' + buildRangeParams();
-  let res;
-  try { res = await fetch(url); } catch(e) { return; }
-  if (!res.ok) {
-    // Background polling failures (including 401) are silently ignored.
-    // The user will only be logged out when they explicitly trigger an action
-    // and the server confirms the session is invalid via /admin/api/session.
-    return;
-  }
-  const keys = await res.json();
-  const tbody = document.getElementById('keysTable');
-
-  let totalReq = 0, totalIn = 0, totalOut = 0, totalCostVal = 0;
-  let totalCacheW = 0, totalCacheR = 0, totalSavingsVal = 0;
-  let html = '';
-  for (const k of keys) {
-    totalReq += k.request_count;
-    totalIn += k.input_tokens;
-    totalOut += k.output_tokens;
-    totalCacheW += k.cache_creation_input_tokens || 0;
-    totalCacheR += k.cache_read_input_tokens || 0;
-    const keyCost = k.cost_usd || 0;
-    totalCostVal += keyCost;
-    totalSavingsVal += k.cache_savings_usd || 0;
-
-    let modelDetail = '';
-    if (k.by_model && Object.keys(k.by_model).length > 0) {
-      const parts = [];
-      for (const [model, usage] of Object.entries(k.by_model)) {
-        const shortName = model.replace('claude-', '').replace(/-\d{8}$/, '');
-        parts.push('<span>' + escHtml(shortName) + ': ' + formatNumber(usage.input_tokens) + '/' + formatNumber(usage.output_tokens) + '</span>');
-      }
-      modelDetail = '<div class="model-detail">' + parts.join('') + '</div>';
-    }
-
-    // Total budget cell
-    const budgetLimit = k.budget_limit_usd || 0;
-    let totalBudgetCell;
-    if (budgetLimit > 0) {
-      const pct = Math.min(keyCost / budgetLimit * 100, 100);
-      const barColor = pct >= 100 ? '#f85149' : pct >= 80 ? '#d29922' : '#3fb950';
-      totalBudgetCell = '<td><div class="budget-wrap">' +
-        '<div class="budget-nums"><span style="color:' + barColor + '">' + formatCost(keyCost) + '</span><span style="color:#6e7681">/ ' + formatCost(budgetLimit) + '</span></div>' +
-        '<div class="budget-bar-bg"><div class="budget-bar-fill" style="width:' + pct.toFixed(1) + '%;background:' + barColor + '"></div></div>' +
-        '<button class="limit-edit" onclick="showBudgetModal(\'' + escAttr(k.key) + '\',\'' + escAttr(k.name) + '\',' + budgetLimit + ',' + (k.daily_limit_usd||0) + ')">edit</button>' +
-        '</div></td>';
-    } else {
-      totalBudgetCell = '<td><button class="limit-edit" onclick="showBudgetModal(\'' + escAttr(k.key) + '\',\'' + escAttr(k.name) + '\',0,' + (k.daily_limit_usd||0) + ')">set limit</button></td>';
-    }
-
-    // Daily budget cell
-    const dailyLimit = k.daily_limit_usd || 0;
-    const costToday = k.cost_today_usd || 0;
-    let dailyBudgetCell;
-    if (dailyLimit > 0) {
-      const dpct = Math.min(costToday / dailyLimit * 100, 100);
-      const dcolor = dpct >= 100 ? '#f85149' : dpct >= 80 ? '#d29922' : '#58a6ff';
-      dailyBudgetCell = '<td><div class="budget-wrap">' +
-        '<div class="budget-nums"><span style="color:' + dcolor + '">' + formatCost(costToday) + '</span><span style="color:#6e7681">/ ' + formatCost(dailyLimit) + '</span></div>' +
-        '<div class="budget-bar-bg"><div class="budget-bar-fill" style="width:' + dpct.toFixed(1) + '%;background:' + dcolor + '"></div></div>' +
-        '<button class="limit-edit" onclick="showBudgetModal(\'' + escAttr(k.key) + '\',\'' + escAttr(k.name) + '\',' + budgetLimit + ',' + dailyLimit + ')">edit</button>' +
-        '</div></td>';
-    } else {
-      dailyBudgetCell = '<td><button class="limit-edit" onclick="showBudgetModal(\'' + escAttr(k.key) + '\',\'' + escAttr(k.name) + '\',' + budgetLimit + ',0)">set limit</button></td>';
-    }
-
-    const lastActiveStr = k.last_active ? formatRelTime(k.last_active) : '<span style="color:#6e7681">—</span>';
-    html += '<tr>' +
-      '<td class="name-cell">' + escHtml(k.name) + '</td>' +
-      '<td class="mono" style="white-space:nowrap">' + escHtml(k.masked_key) + ' <button class="limit-edit" onclick="copyKey(\'' + escAttr(k.key) + '\',this)">copy</button></td>' +
-      '<td class="token-num">' + formatNumber(k.request_count) + '</td>' +
-      '<td class="token-num">' + formatNumber(k.input_tokens) + modelDetail + '</td>' +
-      '<td class="token-num">' + formatNumber(k.output_tokens) + '</td>' +
-      '<td class="cost-cell token-num">' + formatCost(keyCost) + '</td>' +
-      totalBudgetCell +
-      dailyBudgetCell +
-      '<td style="white-space:nowrap;font-size:12px;color:#6e7681">' + lastActiveStr + '</td>' +
-      '<td><button class="btn btn-danger btn-sm" onclick="removeKey(\'' + escAttr(k.key) + '\',\'' + escAttr(k.name) + '\')">Delete</button></td>' +
-      '</tr>';
-  }
-  if (keys.length === 0) {
-    html = '<tr><td colspan="10" style="text-align:center;color:#6e7681;padding:40px">No virtual keys configured</td></tr>';
-  }
-  tbody.innerHTML = html;
-
-  document.getElementById('totalRequests').textContent = formatNumber(totalReq);
-  document.getElementById('totalInput').textContent = formatNumber(totalIn);
-  document.getElementById('totalOutput').textContent = formatNumber(totalOut);
-  document.getElementById('totalCost').textContent = formatCost(totalCostVal);
-  document.getElementById('totalCacheWrite').textContent = formatNumber(totalCacheW);
-  document.getElementById('totalCacheRead').textContent = formatNumber(totalCacheR);
-  document.getElementById('cacheSavings').textContent = formatCost(totalSavingsVal);
-  const totalAllInput = totalIn + totalCacheR + totalCacheW;
-  document.getElementById('cacheHitRate').textContent = totalAllInput > 0
-    ? (totalCacheR / totalAllInput * 100).toFixed(1) + '%'
-    : '-';
-  // Also refresh key filter dropdown while keeping current selection.
-  populateKeyFilter(keys);
-}
-
-let _lastKeys = [];
-function populateKeyFilter(keys) {
-  _lastKeys = keys;
-  const sel = document.getElementById('keyFilter');
-  const prev = sel.value;
-  sel.innerHTML = '<option value="">All Keys</option>';
-  for (const k of keys) {
-    const opt = document.createElement('option');
-    opt.value = k.key;
-    opt.textContent = k.name;
-    sel.appendChild(opt);
-  }
-  if ([...sel.options].some(o => o.value === prev)) sel.value = prev;
-}
-
-async function loadStats() {
-  const p = new URLSearchParams();
-  if (currentFrom) p.set('from', currentFrom);
-  if (currentTo) p.set('to', currentTo);
-  const keyFilter = document.getElementById('keyFilter');
-  if (keyFilter && keyFilter.value) p.set('key', keyFilter.value);
-  const qs = p.toString() ? '?' + p.toString() : '';
-  let res;
-  try { res = await fetch(API + '/stats' + qs); } catch(e) { return; }
-  if (!res.ok) return;
-  const buckets = await res.json();
-  renderTimeseriesChart(buckets);
-  renderDistributionChart(_lastKeys, keyFilter ? keyFilter.value : '');
-}
-
-function formatBucketLabel(isoStr) {
-  const d = new Date(isoStr);
-  // Detect granularity from string: contains 'T' and non-zero hour → hourly
-  if (isoStr.includes('T') && isoStr.slice(11, 13) !== '00') {
-    return (d.getMonth()+1) + '/' + d.getDate() + ' ' + String(d.getHours()).padStart(2,'0') + ':00';
-  }
-  return (d.getMonth()+1) + '/' + d.getDate();
-}
-
-function renderTimeseriesChart(buckets) {
-  const canvas = document.getElementById('timeseriesChart');
-  if (!canvas) return;
-  canvas._lastBuckets = buckets;
-  const dpr = window.devicePixelRatio || 1;
-  const W = canvas.offsetWidth || 400;
-  const H = canvas.offsetHeight || 200;
-  canvas.width = W * dpr;
-  canvas.height = H * dpr;
-  const ctx = canvas.getContext('2d');
-  ctx.scale(dpr, dpr);
-
-  const PAD = { top: 20, right: 55, bottom: 36, left: 55 };
-  const cw = W - PAD.left - PAD.right;
-  const ch = H - PAD.top - PAD.bottom;
-
-  ctx.clearRect(0, 0, W, H);
-
-  if (!buckets || buckets.length === 0) {
-    ctx.fillStyle = '#6e7681';
-    ctx.font = '13px "Fira Code", monospace';
-    ctx.textAlign = 'center';
-    ctx.fillText('No data for selected range', W/2, H/2);
-    return;
-  }
-
-  const maxReq = Math.max(...buckets.map(b => b.requests), 1);
-  const maxCost = Math.max(...buckets.map(b => b.cost_usd), 0.000001);
-  const n = buckets.length;
-
-  // Grid lines
-  ctx.strokeStyle = '#21262d';
-  ctx.lineWidth = 1;
-  for (let i = 0; i <= 4; i++) {
-    const y = PAD.top + (ch / 4) * i;
-    ctx.beginPath(); ctx.moveTo(PAD.left, y); ctx.lineTo(PAD.left + cw, y); ctx.stroke();
-  }
-
-  // Left axis labels (requests, blue)
-  ctx.fillStyle = '#58a6ff';
-  ctx.font = '10px "Fira Code", monospace';
-  ctx.textAlign = 'right';
-  for (let i = 0; i <= 4; i++) {
-    const val = Math.round(maxReq * (1 - i/4));
-    ctx.fillText(val, PAD.left - 4, PAD.top + (ch/4)*i + 4);
-  }
-
-  // Right axis labels (cost, green)
-  ctx.fillStyle = '#3fb950';
-  ctx.textAlign = 'left';
-  for (let i = 0; i <= 4; i++) {
-    const val = (maxCost * (1 - i/4));
-    const label = val < 0.01 ? '$' + val.toFixed(4) : '$' + val.toFixed(2);
-    ctx.fillText(label, PAD.left + cw + 4, PAD.top + (ch/4)*i + 4);
-  }
-
-  function xPos(i) { return PAD.left + (n === 1 ? cw/2 : (i / (n-1)) * cw); }
-
-  // Requests line (blue)
-  ctx.strokeStyle = '#58a6ff';
-  ctx.lineWidth = 2;
-  ctx.beginPath();
-  buckets.forEach((b, i) => {
-    const x = xPos(i);
-    const y = PAD.top + ch * (1 - b.requests / maxReq);
-    i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
-  });
-  ctx.stroke();
-
-  // Cost line (green)
-  ctx.strokeStyle = '#3fb950';
-  ctx.lineWidth = 2;
-  ctx.beginPath();
-  buckets.forEach((b, i) => {
-    const x = xPos(i);
-    const y = PAD.top + ch * (1 - b.cost_usd / maxCost);
-    i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
-  });
-  ctx.stroke();
-
-  // X axis labels (sparse, max 8)
-  ctx.fillStyle = '#8b949e';
-  ctx.textAlign = 'center';
-  ctx.font = '10px "Fira Code", monospace';
-  const step = Math.ceil(n / 8);
-  for (let i = 0; i < n; i += step) {
-    const x = xPos(i);
-    ctx.fillText(formatBucketLabel(buckets[i].time), x, PAD.top + ch + 18);
-  }
-  // Always label last bucket
-  if ((n-1) % step !== 0) {
-    ctx.fillText(formatBucketLabel(buckets[n-1].time), xPos(n-1), PAD.top + ch + 18);
-  }
-}
-
-function renderDistributionChart(keys, filterKey) {
-  const canvas = document.getElementById('distributionChart');
-  const legend = document.getElementById('distributionLegend');
-  if (!canvas) return;
-
-  const data = filterKey
-    ? keys.filter(k => k.key === filterKey)
-    : keys.filter(k => (k.cost_usd || 0) > 0);
-
-  const dpr = window.devicePixelRatio || 1;
-  const W = canvas.offsetWidth || 400;
-  const H = canvas.offsetHeight || 160;
-  canvas.width = W * dpr;
-  canvas.height = H * dpr;
-  const ctx = canvas.getContext('2d');
-  ctx.scale(dpr, dpr);
-  ctx.clearRect(0, 0, W, H);
-
-  if (data.length === 0) {
-    ctx.fillStyle = '#6e7681';
-    ctx.font = '13px "Fira Code", monospace';
-    ctx.textAlign = 'center';
-    ctx.fillText('No cost data', W/2, H/2);
-    if (legend) legend.innerHTML = '';
-    return;
-  }
-
-  const BAR_COLORS = ['#58a6ff','#3fb950','#d29922','#f85149','#bc8cff','#79c0ff','#56d364','#ffa657'];
-  const PAD = { top: 12, right: 12, bottom: 28, left: 48 };
-  const cw = W - PAD.left - PAD.right;
-  const ch = H - PAD.top - PAD.bottom;
-  const maxCost = Math.max(...data.map(k => k.cost_usd || 0), 0.000001);
-  const barW = Math.max(4, cw / data.length * 0.6);
-  const gap = cw / data.length;
-
-  // Grid
-  ctx.strokeStyle = '#21262d';
-  ctx.lineWidth = 1;
-  for (let i = 0; i <= 3; i++) {
-    const y = PAD.top + (ch/3)*i;
-    ctx.beginPath(); ctx.moveTo(PAD.left, y); ctx.lineTo(PAD.left+cw, y); ctx.stroke();
-  }
-
-  // Left axis
-  ctx.fillStyle = '#8b949e';
-  ctx.font = '10px "Fira Code", monospace';
-  ctx.textAlign = 'right';
-  for (let i = 0; i <= 3; i++) {
-    const val = maxCost * (1 - i/3);
-    ctx.fillText(val < 0.01 ? '$'+val.toFixed(4) : '$'+val.toFixed(2), PAD.left-4, PAD.top+(ch/3)*i+4);
-  }
-
-  // Bars
-  data.forEach((k, i) => {
-    const cost = k.cost_usd || 0;
-    const barH = ch * (cost / maxCost);
-    const x = PAD.left + gap * (i + 0.5) - barW/2;
-    const y = PAD.top + ch - barH;
-    ctx.fillStyle = BAR_COLORS[i % BAR_COLORS.length];
-    ctx.beginPath();
-    ctx.roundRect ? ctx.roundRect(x, y, barW, barH, [3,3,0,0]) : ctx.rect(x, y, barW, barH);
-    ctx.fill();
-    // X label
-    ctx.fillStyle = '#8b949e';
-    ctx.textAlign = 'center';
-    ctx.font = '10px "Fira Code", monospace';
-    const label = k.name.length > 8 ? k.name.slice(0, 7) + '…' : k.name;
-    ctx.fillText(label, PAD.left + gap*(i+0.5), PAD.top+ch+16);
-  });
-
-  // Legend
-  if (legend) {
-    legend.innerHTML = data.map((k, i) =>
-      '<span class="legend-item"><span class="legend-dot" style="background:' + BAR_COLORS[i%BAR_COLORS.length] + '"></span>' +
-      escHtml(k.name) + ': ' + formatCost(k.cost_usd||0) + '</span>'
-    ).join('');
-  }
-}
-
-// Redraw charts on container resize
-if (window.ResizeObserver) {
-  const ro = new ResizeObserver(() => {
-    const el = document.getElementById('timeseriesChart');
-    if (el && el._lastBuckets) renderTimeseriesChart(el._lastBuckets);
-    renderDistributionChart(_lastKeys, document.getElementById('keyFilter')?.value || '');
-  });
-  document.querySelectorAll('.chart-card').forEach(c => ro.observe(c));
-}
-
-function showAddModal() {
-  document.getElementById('newName').value = '';
-  document.getElementById('newKey').value = '';
-  document.getElementById('addModal').classList.add('active');
-  document.getElementById('newName').focus();
-}
-
-function hideAddModal() {
-  document.getElementById('addModal').classList.remove('active');
-}
-
-async function addKey() {
-  const name = document.getElementById('newName').value.trim();
-  const key = document.getElementById('newKey').value.trim();
-  if (!name || !key) return;
-  await fetch(API + '/keys', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ name, key })
-  });
-  hideAddModal();
-  loadKeys();
-}
-
-async function removeKey(key, name) {
-  if (!confirm('Delete key "' + name + '"? This will also delete all usage history.')) return;
-  await fetch(API + '/keys', {
-    method: 'DELETE',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ key })
-  });
-  showToast('Key "' + name + '" deleted');
-  loadKeys();
-}
-
-function escHtml(s) {
-  const d = document.createElement('div');
-  d.textContent = s;
-  return d.innerHTML;
-}
-
-function escAttr(s) {
-  return s.replace(/\\/g, '\\\\').replace(/'/g, "\\'").replace(/"/g, '\\"');
-}
-
-async function loadToken() {
-  const res = await fetch(API + '/token');
-  if (res.ok) {
-    const data = await res.json();
-    document.getElementById('currentToken').textContent = data.masked_token;
-  }
-}
-
-function toggleTokenVisibility() {
-  const input = document.getElementById('tokenInput');
-  const btn = input.nextElementSibling;
-  if (input.type === 'password') {
-    input.type = 'text';
-    btn.textContent = 'Hide';
-  } else {
-    input.type = 'password';
-    btn.textContent = 'Show';
-  }
-}
-
-async function updateToken() {
-  const token = document.getElementById('tokenInput').value.trim();
-  if (!token) return;
-  const res = await fetch(API + '/token', {
-    method: 'PUT',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ token })
-  });
-  if (res.ok) {
-    const data = await res.json();
-    document.getElementById('currentToken').textContent = data.masked_token;
-    document.getElementById('tokenInput').value = '';
-    document.getElementById('tokenInput').type = 'password';
-    document.getElementById('tokenInput').nextElementSibling.textContent = 'Show';
-  }
-}
-
-async function importCSV(input) {
-  const file = input.files[0];
-  if (!file) return;
-  const text = await file.text();
-  const lines = text.trim().split('\n').filter(l => l.trim() && !l.startsWith('#'));
-  let added = 0, errors = 0;
-  for (const line of lines) {
-    const parts = line.split(',').map(s => s.trim());
-    if (parts.length < 2 || !parts[0] || !parts[1]) { errors++; continue; }
-    const [name, key] = parts;
-    const res = await fetch(API + '/keys', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ name, key })
-    });
-    if (res.ok) added++; else errors++;
-  }
-  input.value = '';
-  alert('Imported ' + added + ' key(s)' + (errors > 0 ? ', ' + errors + ' failed' : ''));
-  loadKeys();
-}
-
-async function copyKey(key, el) {
-  try {
-    await navigator.clipboard.writeText(key);
-    const orig = el.textContent;
-    el.textContent = 'copied!';
-    setTimeout(() => el.textContent = orig, 1500);
-  } catch(e) {
-    showToast('Copy failed — check clipboard permissions');
-  }
-}
-
-function showBudgetModal(key, name, currentTotal, currentDaily) {
-  document.getElementById('budgetKey').value = key;
-  document.getElementById('budgetModalTitle').textContent = 'Limits — ' + name;
-  document.getElementById('budgetTotal').value = currentTotal > 0 ? currentTotal : '';
-  document.getElementById('budgetDaily').value = currentDaily > 0 ? currentDaily : '';
-  document.getElementById('budgetModal').classList.add('active');
-  document.getElementById('budgetTotal').focus();
-}
-
-function hideBudgetModal() {
-  document.getElementById('budgetModal').classList.remove('active');
-}
-
-async function saveBudget() {
-  const key = document.getElementById('budgetKey').value;
-  const totalVal = document.getElementById('budgetTotal').value;
-  const dailyVal = document.getElementById('budgetDaily').value;
-  const budget = totalVal === '' ? 0 : parseFloat(totalVal);
-  const daily = dailyVal === '' ? 0 : parseFloat(dailyVal);
-  if (isNaN(budget) || budget < 0 || isNaN(daily) || daily < 0) {
-    showToast('Invalid amount — must be 0 or positive');
-    return;
-  }
-  await fetch(API + '/budget', {
-    method: 'PUT',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ key, budget_limit_usd: budget, daily_limit_usd: daily })
-  });
-  hideBudgetModal();
-  showToast('Limits saved');
-  loadKeys();
-}
-
-let toastTimer;
-function showToast(msg) {
-  const t = document.getElementById('toast');
-  t.textContent = msg;
-  t.classList.add('show');
-  clearTimeout(toastTimer);
-  toastTimer = setTimeout(() => t.classList.remove('show'), 3000);
-}
-
-// Close modals on overlay click
-document.getElementById('addModal').addEventListener('click', e => { if (e.target === e.currentTarget) hideAddModal(); });
-document.getElementById('budgetModal').addEventListener('click', e => { if (e.target === e.currentTarget) hideBudgetModal(); });
-
-// Enter key in budget modal
-document.addEventListener('keydown', e => {
-  if (e.key === 'Escape') { hideAddModal(); hideBudgetModal(); }
-});
-
-checkSession();
-</script>
-</body>
-</html>`
+//go:embed static/index.html
+var adminHTML string

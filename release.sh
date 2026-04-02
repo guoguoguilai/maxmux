@@ -10,7 +10,7 @@ if [ -z "$VERSION" ]; then
 fi
 
 echo "==> Building image for linux/amd64: $IMAGE:$VERSION"
-docker build --platform linux/amd64 -t "$IMAGE:$VERSION" -t "$IMAGE:latest" .
+docker buildx build --platform linux/amd64 -t "$IMAGE:$VERSION" -t "$IMAGE:latest" .
 
 echo "==> Pushing $IMAGE:$VERSION and $IMAGE:latest"
 docker push "$IMAGE:$VERSION"
