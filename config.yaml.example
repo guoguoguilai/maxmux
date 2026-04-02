@@ -1,0 +1,6 @@
+port: 4000
+upstream: https://api.anthropic.com
+
+admin:
+  username: admin
+  password: CHANGE_ME
