@@ -230,6 +230,11 @@ func (s *Store) RemoveKey(key string) (bool, error) {
 	return n > 0, nil
 }
 
+func (s *Store) RenameKey(key, newName string) error {
+	_, err := s.db.Exec("UPDATE virtual_keys SET name = ? WHERE key = ?", newName, key)
+	return err
+}
+
 func (s *Store) SetBudget(key string, budgetUSD float64) error {
 	_, err := s.db.Exec("UPDATE virtual_keys SET budget_limit_usd = ? WHERE key = ?", budgetUSD, key)
 	return err
@@ -640,6 +645,19 @@ func (m *KeyManager) SetDisabled(key string, disabled bool) error {
 	m.mu.Lock()
 	if info, ok := m.keys[key]; ok {
 		info.disabled = disabled
+		m.keys[key] = info
+	}
+	m.mu.Unlock()
+	return nil
+}
+
+func (m *KeyManager) Rename(key, newName string) error {
+	if err := m.store.RenameKey(key, newName); err != nil {
+		return err
+	}
+	m.mu.Lock()
+	if info, ok := m.keys[key]; ok {
+		info.name = newName
 		m.keys[key] = info
 	}
 	m.mu.Unlock()
@@ -1506,6 +1524,28 @@ func main() {
 				return
 			}
 			log.Info().Str("key", maskToken(req.Key)).Msg("virtual key removed")
+			writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+			return
+		}
+
+		if r.URL.Path == "/admin/api/keys/rename" && r.Method == http.MethodPut {
+			if !requireAdmin(w, r) {
+				return
+			}
+			var req struct {
+				Key  string `json:"key"`
+				Name string `json:"name"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Key == "" || req.Name == "" {
+				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "key and name are required"})
+				return
+			}
+			if err := keyMgr.Rename(req.Key, req.Name); err != nil {
+				log.Error().Err(err).Msg("failed to rename key")
+				writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
+				return
+			}
+			log.Info().Str("key", maskToken(req.Key)).Str("name", req.Name).Msg("key renamed")
 			writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 			return
 		}

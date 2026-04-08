@@ -707,7 +707,7 @@ function renderKeysTable(keys) {
       : '<button class="btn btn-secondary btn-sm" onclick="toggleKey(\'' + escAttr(k.key) + '\',true)">Disable</button>';
     const rowStyle = isDisabled ? ' style="opacity:0.5"' : '';
     html += '<tr' + rowStyle + '>' +
-      '<td class="name-cell">' + escHtml(k.name) + '</td>' +
+      '<td class="name-cell"><span onclick="renameKey(\'' + escAttr(k.key) + '\',\'' + escAttr(k.name) + '\')" style="cursor:pointer" title="Click to rename">' + escHtml(k.name) + '</span> <button class="limit-edit" onclick="renameKey(\'' + escAttr(k.key) + '\',\'' + escAttr(k.name) + '\')">edit</button></td>' +
       '<td class="mono" style="white-space:nowrap">' + escHtml(k.masked_key) + ' <button class="limit-edit" onclick="copyKey(\'' + escAttr(k.key) + '\',this)">copy</button></td>' +
       '<td>' + statusTag + '</td>' +
       '<td class="token-num">' + formatNumber(k.request_count) + '</td>' +
@@ -982,6 +982,19 @@ document.getElementById('budgetModal').addEventListener('click', e => { if (e.ta
 document.getElementById('addTokenModal').addEventListener('click', e => { if (e.target === e.currentTarget) hideAddTokenModal(); });
 document.getElementById('feishuModal').addEventListener('click', e => { if (e.target === e.currentTarget) hideFeishuModal(); });
 document.addEventListener('keydown', e => { if (e.key === 'Escape') { hideAddModal(); hideBudgetModal(); hideAddTokenModal(); hideFeishuModal(); } });
+
+// ── Rename Key ──
+async function renameKey(key, currentName) {
+  const newName = prompt('Rename "' + currentName + '" to:', currentName);
+  if (!newName || newName.trim() === '' || newName.trim() === currentName) return;
+  const res = await fetch(API + '/keys/rename', {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ key, name: newName.trim() })
+  });
+  if (res.ok) { showToast('Renamed to "' + newName.trim() + '"'); loadKeys(); }
+  else { showToast('Rename failed'); }
+}
 
 // ── Feishu Webhook ──
 function sendToFeishu() {
