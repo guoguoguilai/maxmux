@@ -181,7 +181,7 @@
 <div class="dashboard" id="dashboard">
   <div class="header">
     <div class="header-left">
-      <span class="header-logo">maxmux</span>
+      <span class="header-logo">maxmux <span id="versionTag" style="font-size:11px;color:#8b949e;font-weight:400"></span></span>
       <div class="time-filter" id="timeFilter">
         <button data-preset="5m" onclick="setPreset(this)">5m</button>
         <button data-preset="1h" onclick="setPreset(this)">1h</button>
@@ -600,7 +600,12 @@ async function checkSession() {
   for (let i = 0; i < 3; i++) {
     try {
       const res = await fetch(API + '/session');
-      if (res.ok) { showDashboard(); return; }
+      if (res.ok) {
+        const data = await res.json();
+        if (data.version) document.getElementById('versionTag').textContent = data.version;
+        showDashboard();
+        return;
+      }
       if (res.status === 401) return;
     } catch(e) {}
     await new Promise(r => setTimeout(r, 500));

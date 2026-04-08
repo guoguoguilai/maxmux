@@ -1041,6 +1041,8 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	json.NewEncoder(w).Encode(v)
 }
 
+var version = "dev"
+
 func main() {
 	configPath := flag.String("config", "config.yaml", "path to config file")
 	dataPath := flag.String("data", "", "path to SQLite database (e.g. /data/maxmux.db)")
@@ -1533,7 +1535,7 @@ func main() {
 				writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
 				return
 			}
-			writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+			writeJSON(w, http.StatusOK, map[string]string{"status": "ok", "version": version})
 			return
 		}
 
