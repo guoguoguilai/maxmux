@@ -2,23 +2,22 @@
 set -e
 
 IMAGE="pageguo/maxmux"
-VERSION=${1:-}
+VERSION=$(grep -oP 'var version = "\K[^"]+' main.go)
 
 if [ -z "$VERSION" ]; then
-  echo "Usage: ./release.sh <version>  e.g. ./release.sh v0.4"
+  echo "Error: could not read version from main.go"
   exit 1
 fi
 
+echo "==> Version from main.go: $VERSION"
 echo "==> Building image for linux/amd64: $IMAGE:$VERSION"
-docker buildx build --platform linux/amd64 --build-arg VERSION="$VERSION" -t "$IMAGE:$VERSION" -t "$IMAGE:latest" .
+docker buildx build --platform linux/amd64 -t "$IMAGE:$VERSION" -t "$IMAGE:latest" .
 
 echo "==> Pushing $IMAGE:$VERSION and $IMAGE:latest"
 docker push "$IMAGE:$VERSION"
 docker push "$IMAGE:latest"
 
-echo "==> Tagging git commit as $VERSION"
-git tag "$VERSION"
-git push mine "$VERSION"
+echo "==> Pushing code to remote"
 git push mine master
 
-echo "==> Done: $IMAGE:$VERSION pushed to Docker Hub and git tag $VERSION pushed"
+echo "==> Done: $IMAGE:$VERSION pushed to Docker Hub"

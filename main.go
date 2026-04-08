@@ -1059,7 +1059,7 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	json.NewEncoder(w).Encode(v)
 }
 
-var version = "dev"
+var version = "v0.5.1"
 
 func main() {
 	configPath := flag.String("config", "config.yaml", "path to config file")
