@@ -42,12 +42,13 @@ type AdminConfig struct {
 }
 
 type Config struct {
-	Port        int                `yaml:"port"`
-	Upstream    string             `yaml:"upstream"`
-	OAuthToken  string             `yaml:"oauth_token"`
-	OAuthTokens []string           `yaml:"oauth_tokens"`
-	Admin       AdminConfig        `yaml:"admin"`
-	SeedKeys    []VirtualKeyConfig `yaml:"virtual_keys"`
+	Port           int                `yaml:"port"`
+	Upstream       string             `yaml:"upstream"`
+	OAuthToken     string             `yaml:"oauth_token"`
+	OAuthTokens    []string           `yaml:"oauth_tokens"`
+	Admin          AdminConfig        `yaml:"admin"`
+	SeedKeys       []VirtualKeyConfig `yaml:"virtual_keys"`
+	FeishuWebhook  string             `yaml:"feishu_webhook"`
 }
 
 // UsageRecord stores a single request's usage data with timestamp.
@@ -1017,6 +1018,16 @@ func (tp *TokenPool) SetCurrent(id int) bool {
 
 type ctxStartKey struct{}
 
+func formatTokenCount(n int64) string {
+	if n >= 1_000_000 {
+		return fmt.Sprintf("%.1fM", float64(n)/1_000_000)
+	}
+	if n >= 1_000 {
+		return fmt.Sprintf("%.1fK", float64(n)/1_000)
+	}
+	return fmt.Sprintf("%d", n)
+}
+
 func maskToken(t string) string {
 	if len(t) <= 16 {
 		return "***"
@@ -1757,6 +1768,168 @@ func main() {
 				writeJSON(w, http.StatusNotFound, map[string]string{"error": "token not found"})
 				return
 			}
+			writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+			return
+		}
+
+		// --- Feishu Webhook ---
+		if r.URL.Path == "/admin/api/feishu" && r.Method == http.MethodPost {
+			if !requireAdmin(w, r) {
+				return
+			}
+			if cfg.FeishuWebhook == "" {
+				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "feishu_webhook not configured in config.yaml"})
+				return
+			}
+			var req struct {
+				Keys []string `json:"keys"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request"})
+				return
+			}
+
+			// Gather usage data for all keys, then filter.
+			allUsage, err := store.QueryAll(time.Time{}, time.Now())
+			if err != nil {
+				log.Error().Err(err).Msg("feishu: failed to query usage")
+				writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to query usage"})
+				return
+			}
+			keys := keyMgr.List()
+			wantAll := len(req.Keys) == 0
+			wantSet := make(map[string]bool, len(req.Keys))
+			for _, k := range req.Keys {
+				wantSet[k] = true
+			}
+
+			type keyRow struct {
+				Name      string
+				Requests  int64
+				Input     int64
+				Output    int64
+				Cost      float64
+				CostToday float64
+			}
+			var rows []keyRow
+			var totalCost float64
+			for _, k := range keys {
+				if !wantAll && !wantSet[k.Key] {
+					continue
+				}
+				u := allUsage[k.Key]
+				var cost float64
+				for model, mu := range u.ByModel {
+					inp, out := getModelPricing(model)
+					cost += (float64(mu.InputTokens)*inp +
+						float64(mu.OutputTokens)*out +
+						float64(mu.CacheCreationInputTokens)*inp*1.25 +
+						float64(mu.CacheReadInputTokens)*inp*0.1) / 1_000_000
+				}
+				costToday, _ := store.QueryKeyCostToday(k.Key)
+				rows = append(rows, keyRow{
+					Name:      k.Name,
+					Requests:  u.RequestCount,
+					Input:     u.InputTokens,
+					Output:    u.OutputTokens,
+					Cost:      math.Round(cost*10000) / 10000,
+					CostToday: math.Round(costToday*10000) / 10000,
+				})
+				totalCost += cost
+			}
+
+			// Build Feishu interactive card using column_set for clean table layout.
+			now := time.Now().UTC().Add(8 * time.Hour) // China time
+			title := fmt.Sprintf("Maxmux Usage Report — %s", now.Format("2006-01-02 15:04"))
+
+			// Helper to build a column_set row.
+			makeRow := func(bgStyle string, vals [6]string, bold bool) map[string]any {
+				cols := make([]any, 6)
+				weights := [6]int{2, 1, 2, 2, 2, 2}
+				for i, v := range vals {
+					content := v
+					if bold {
+						content = "**" + v + "**"
+					}
+					cols[i] = map[string]any{
+						"tag":    "column",
+						"width":  "weighted",
+						"weight": weights[i],
+						"elements": []any{
+							map[string]any{
+								"tag":     "markdown",
+								"content": content,
+							},
+						},
+					}
+				}
+				return map[string]any{
+					"tag":              "column_set",
+					"flex_mode":        "none",
+					"background_style": bgStyle,
+					"columns":          cols,
+				}
+			}
+
+			elements := []any{
+				makeRow("grey", [6]string{"Name", "Reqs", "Input", "Output", "Total", "Today"}, true),
+			}
+			for _, r := range rows {
+				costStr := fmt.Sprintf("$%.2f", r.Cost)
+				if r.Cost < 0.01 {
+					costStr = fmt.Sprintf("$%.4f", r.Cost)
+				}
+				todayStr := fmt.Sprintf("$%.2f", r.CostToday)
+				if r.CostToday < 0.01 {
+					todayStr = fmt.Sprintf("$%.4f", r.CostToday)
+				}
+				elements = append(elements, makeRow("default", [6]string{
+					r.Name,
+					fmt.Sprintf("%d", r.Requests),
+					formatTokenCount(r.Input),
+					formatTokenCount(r.Output),
+					costStr,
+					todayStr,
+				}, false))
+			}
+			// Divider + total
+			elements = append(elements,
+				map[string]any{"tag": "hr"},
+				map[string]any{
+					"tag":     "markdown",
+					"content": fmt.Sprintf("**Total Cost: $%.4f**", totalCost),
+				},
+			)
+
+			card := map[string]any{
+				"msg_type": "interactive",
+				"card": map[string]any{
+					"header": map[string]any{
+						"title": map[string]any{
+							"tag":     "plain_text",
+							"content": title,
+						},
+						"template": "blue",
+					},
+					"elements": elements,
+				},
+			}
+
+			cardJSON, _ := json.Marshal(card)
+			resp, err := http.Post(cfg.FeishuWebhook, "application/json", bytes.NewReader(cardJSON))
+			if err != nil {
+				log.Error().Err(err).Msg("feishu: failed to send webhook")
+				writeJSON(w, http.StatusBadGateway, map[string]string{"error": "failed to send to feishu: " + err.Error()})
+				return
+			}
+			defer resp.Body.Close()
+			body, _ := io.ReadAll(resp.Body)
+			if resp.StatusCode != http.StatusOK {
+				log.Error().Int("status", resp.StatusCode).Str("body", string(body)).Msg("feishu: webhook returned error")
+				writeJSON(w, http.StatusBadGateway, map[string]string{"error": "feishu returned " + resp.Status})
+				return
+			}
+			log.Info().Int("keys", len(rows)).Msg("feishu: usage report sent")
 			writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 			return
 		}

@@ -261,6 +261,7 @@
       <div class="section-header">
         <h2>Virtual Keys</h2>
         <div class="section-actions">
+          <button class="btn btn-secondary btn-sm" onclick="sendToFeishu()">Send to Feishu</button>
           <label class="btn btn-secondary btn-sm" style="cursor:pointer">Import CSV<input type="file" accept=".csv,.txt" style="display:none" onchange="importCSV(this)"></label>
           <button class="btn btn-blue btn-sm" onclick="showAddModal()">+ Add Key</button>
         </div>
@@ -364,6 +365,25 @@
     <div class="modal-actions">
       <button class="btn btn-secondary" onclick="hideAddTokenModal()">Cancel</button>
       <button class="btn btn-blue" onclick="addOAuthToken()">Add Token</button>
+    </div>
+  </div>
+</div>
+
+<!-- Feishu Modal -->
+<div class="modal-overlay" id="feishuModal">
+  <div class="modal">
+    <h2>Send Usage Report to Feishu</h2>
+    <div class="form-group">
+      <label>Select Users</label>
+      <div id="feishuKeyList" style="max-height:240px;overflow-y:auto;border:1px solid #30363d;border-radius:6px;padding:8px;background:#0d1117;"></div>
+    </div>
+    <div style="display:flex;gap:8px;margin-bottom:16px;">
+      <button class="btn btn-secondary btn-sm" onclick="feishuSelectAll()">Select All</button>
+      <button class="btn btn-secondary btn-sm" onclick="feishuSelectNone()">Clear</button>
+    </div>
+    <div class="modal-actions">
+      <button class="btn btn-secondary" onclick="hideFeishuModal()">Cancel</button>
+      <button class="btn btn-blue" id="feishuSendBtn" onclick="doSendFeishu()">Send</button>
     </div>
   </div>
 </div>
@@ -955,7 +975,49 @@ function showToast(msg) {
 document.getElementById('addModal').addEventListener('click', e => { if (e.target === e.currentTarget) hideAddModal(); });
 document.getElementById('budgetModal').addEventListener('click', e => { if (e.target === e.currentTarget) hideBudgetModal(); });
 document.getElementById('addTokenModal').addEventListener('click', e => { if (e.target === e.currentTarget) hideAddTokenModal(); });
-document.addEventListener('keydown', e => { if (e.key === 'Escape') { hideAddModal(); hideBudgetModal(); hideAddTokenModal(); } });
+document.getElementById('feishuModal').addEventListener('click', e => { if (e.target === e.currentTarget) hideFeishuModal(); });
+document.addEventListener('keydown', e => { if (e.key === 'Escape') { hideAddModal(); hideBudgetModal(); hideAddTokenModal(); hideFeishuModal(); } });
+
+// ── Feishu Webhook ──
+function sendToFeishu() {
+  const list = document.getElementById('feishuKeyList');
+  let html = '';
+  for (const k of _lastKeys) {
+    html += '<label class="key-filter-item"><input type="checkbox" value="' + escAttr(k.key) + '" checked> ' + escHtml(k.name) + '</label>';
+  }
+  list.innerHTML = html;
+  document.getElementById('feishuModal').classList.add('active');
+}
+function hideFeishuModal() { document.getElementById('feishuModal').classList.remove('active'); }
+function feishuSelectAll() { document.querySelectorAll('#feishuKeyList input[type=checkbox]').forEach(c => c.checked = true); }
+function feishuSelectNone() { document.querySelectorAll('#feishuKeyList input[type=checkbox]').forEach(c => c.checked = false); }
+async function doSendFeishu() {
+  const checks = document.querySelectorAll('#feishuKeyList input[type=checkbox]:checked');
+  const keys = [...checks].map(c => c.value);
+  if (keys.length === 0) { showToast('Please select at least one user'); return; }
+  const btn = document.getElementById('feishuSendBtn');
+  btn.disabled = true; btn.textContent = 'Sending...';
+  try {
+    const allChecks = document.querySelectorAll('#feishuKeyList input[type=checkbox]');
+    const sendKeys = keys.length === allChecks.length ? [] : keys;
+    const res = await fetch(API + '/feishu', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ keys: sendKeys })
+    });
+    const data = await res.json();
+    if (res.ok) {
+      showToast('Report sent to Feishu');
+      hideFeishuModal();
+    } else {
+      showToast('Failed: ' + (data.error || res.statusText));
+    }
+  } catch(e) {
+    showToast('Failed to send: ' + e.message);
+  } finally {
+    btn.disabled = false; btn.textContent = 'Send';
+  }
+}
 
 checkSession();
 </script>
