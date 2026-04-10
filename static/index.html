@@ -272,6 +272,7 @@
             <th class="th-sort" onclick="sortTable('name')">Name <span class="sort-arrow" id="sort-name"></span></th>
             <th>Key</th>
             <th>Status</th>
+            <th>Bound Tokens</th>
             <th class="th-sort" onclick="sortTable('requests')">Requests <span class="sort-arrow" id="sort-requests"></span></th>
             <th class="th-sort" onclick="sortTable('input')">Input <span class="sort-arrow" id="sort-input"></span></th>
             <th class="th-sort" onclick="sortTable('output')">Output <span class="sort-arrow" id="sort-output"></span></th>
@@ -292,7 +293,7 @@
           <button class="btn btn-blue btn-sm" onclick="showAddTokenModal()">+ Add Token</button>
         </div>
       </div>
-      <p style="font-size:12px;color:#8b949e;margin-bottom:12px">Tokens are used in order. When the active token hits a rate limit (429/529), the system auto-rotates to the next enabled token.</p>
+      <p style="font-size:12px;color:#8b949e;margin-bottom:12px">Each virtual key must be bound to one or more tokens. Bound tokens are tried in priority order; on a 429/529 the offending token is soft-disabled for 5 minutes and the next bound token takes over on the following request.</p>
       <table>
         <thead>
           <tr>
@@ -300,6 +301,7 @@
             <th>Name</th>
             <th>Token</th>
             <th>Status</th>
+            <th>Bound By</th>
             <th></th>
           </tr>
         </thead>
@@ -346,6 +348,27 @@
     <div class="modal-actions">
       <button class="btn btn-secondary" onclick="hideBudgetModal()">Cancel</button>
       <button class="btn btn-blue" onclick="saveBudget()">Save</button>
+    </div>
+  </div>
+</div>
+
+<!-- Bindings Modal -->
+<div class="modal-overlay" id="bindingsModal">
+  <div class="modal" style="max-width:520px">
+    <h2 id="bindingsModalTitle">Edit Token Bindings</h2>
+    <input type="hidden" id="bindingsKey">
+    <div class="modal-hint" style="margin-bottom:12px">Pick the OAuth tokens this virtual key may use. Order matters — tokens are tried top-to-bottom on each request. A key with no bindings cannot serve traffic.</div>
+    <div class="form-group">
+      <label>Bound Tokens (priority order)</label>
+      <div id="bindingsChosen" style="border:1px solid #30363d;border-radius:6px;background:#0d1117;min-height:48px;padding:4px;"></div>
+    </div>
+    <div class="form-group">
+      <label>Available Tokens</label>
+      <div id="bindingsAvailable" style="border:1px solid #30363d;border-radius:6px;background:#0d1117;max-height:200px;overflow-y:auto;padding:4px;"></div>
+    </div>
+    <div class="modal-actions">
+      <button class="btn btn-secondary" onclick="hideBindingsModal()">Cancel</button>
+      <button class="btn btn-blue" onclick="saveBindings()">Save</button>
     </div>
   </div>
 </div>
@@ -706,10 +729,26 @@ function renderKeysTable(keys) {
       ? '<button class="btn btn-primary btn-sm" onclick="toggleKey(\'' + escAttr(k.key) + '\',false)">Enable</button>'
       : '<button class="btn btn-secondary btn-sm" onclick="toggleKey(\'' + escAttr(k.key) + '\',true)">Disable</button>';
     const rowStyle = isDisabled ? ' style="opacity:0.5"' : '';
+
+    // Bound tokens cell: render chips for each bound token; warn when empty.
+    const bound = k.bound_tokens || [];
+    let boundCell;
+    if (bound.length === 0) {
+      boundCell = '<td><span class="tag tag-red" title="This key cannot serve traffic until a token is bound">NO BINDING</span> <button class="limit-edit" onclick="showBindingsModal(\'' + escAttr(k.key) + '\',\'' + escAttr(k.name) + '\')">bind</button></td>';
+    } else {
+      let chips = '';
+      for (const b of bound) {
+        const cls = b.disabled ? 'tag-red' : 'tag-green';
+        chips += '<span class="tag ' + cls + '" style="margin:2px">' + escHtml(b.name) + '</span>';
+      }
+      boundCell = '<td><div style="display:flex;flex-wrap:wrap;align-items:center;gap:4px">' + chips + '<button class="limit-edit" onclick="showBindingsModal(\'' + escAttr(k.key) + '\',\'' + escAttr(k.name) + '\')">edit</button></div></td>';
+    }
+
     html += '<tr' + rowStyle + '>' +
       '<td class="name-cell"><span onclick="renameKey(\'' + escAttr(k.key) + '\',\'' + escAttr(k.name) + '\')" style="cursor:pointer" title="Click to rename">' + escHtml(k.name) + '</span> <button class="limit-edit" onclick="renameKey(\'' + escAttr(k.key) + '\',\'' + escAttr(k.name) + '\')">edit</button></td>' +
       '<td class="mono" style="white-space:nowrap">' + escHtml(k.masked_key) + ' <button class="limit-edit" onclick="copyKey(\'' + escAttr(k.key) + '\',this)">copy</button></td>' +
       '<td>' + statusTag + '</td>' +
+      boundCell +
       '<td class="token-num">' + formatNumber(k.request_count) + '</td>' +
       '<td class="token-num">' + formatNumber(k.input_tokens) + modelDetail + '</td>' +
       '<td class="token-num">' + formatNumber(k.output_tokens) + '</td>' +
@@ -721,7 +760,7 @@ function renderKeysTable(keys) {
       '</tr>';
   }
   if (sorted.length === 0) {
-    html = '<tr><td colspan="11" style="text-align:center;color:#6e7681;padding:40px">No virtual keys configured</td></tr>';
+    html = '<tr><td colspan="12" style="text-align:center;color:#6e7681;padding:40px">No virtual keys configured</td></tr>';
   }
   tbody.innerHTML = html;
 
@@ -878,10 +917,12 @@ function escHtml(s) { const d = document.createElement('div'); d.textContent = s
 function escAttr(s) { return s.replace(/\\/g, '\\\\').replace(/'/g, "\\'").replace(/"/g, '\\"'); }
 
 // ── OAuth Tokens ──
+let _lastTokens = [];
 async function loadTokens() {
   let res; try { res = await fetch(API + '/tokens'); } catch(e) { return; }
   if (!res.ok) return;
   const tokens = await res.json();
+  _lastTokens = tokens;
   const tbody = document.getElementById('tokensTable');
   if (!tbody) return;
   let html = '';
@@ -889,20 +930,46 @@ async function loadTokens() {
     const activeTag = t.active ? ' <span class="tag tag-green" style="margin-left:4px">IN USE</span>' : '';
     const statusTag = t.disabled ? '<span class="tag tag-red">Disabled</span>' : '<span class="tag tag-green">Enabled</span>';
     const toggleBtn = t.disabled
-      ? '<button class="btn btn-primary btn-sm" onclick="toggleOAuthToken('+t.id+',false)">Enable</button>'
-      : '<button class="btn btn-secondary btn-sm" onclick="toggleOAuthToken('+t.id+',true)">Disable</button>';
+      ? '<button class="btn btn-primary btn-sm" onclick="toggleOAuthToken('+t.id+',\''+escAttr(t.name)+'\',false)">Enable</button>'
+      : '<button class="btn btn-secondary btn-sm" onclick="toggleOAuthToken('+t.id+',\''+escAttr(t.name)+'\',true)">Disable</button>';
     const useBtn = (t.active || t.disabled) ? '' : ' <button class="btn btn-blue btn-sm" onclick="switchOAuthToken('+t.id+')">Use</button>';
     const rowStyle = t.disabled ? ' style="opacity:0.5"' : '';
+    const boundCount = t.bound_key_count || 0;
+    const boundCell = boundCount > 0
+      ? '<span class="tag tag-green" style="cursor:pointer" onclick="showBoundKeysFor('+t.id+',\''+escAttr(t.name)+'\')" title="Click to list bound keys">'+boundCount+' key'+(boundCount>1?'s':'')+'</span>'
+      : '<span style="color:#6e7681">—</span>';
     html += '<tr'+rowStyle+'>' +
       '<td class="mono">'+t.sort_order+'</td>' +
       '<td class="name-cell">'+escHtml(t.name)+activeTag+'</td>' +
       '<td class="mono">'+escHtml(t.masked_token)+'</td>' +
       '<td>'+statusTag+'</td>' +
+      '<td>'+boundCell+'</td>' +
       '<td style="white-space:nowrap">'+useBtn+' '+toggleBtn+
       ' <button class="btn btn-danger btn-sm" onclick="removeOAuthToken('+t.id+',\''+escAttr(t.name)+'\')">Delete</button></td></tr>';
   }
-  if (tokens.length === 0) html = '<tr><td colspan="5" style="text-align:center;color:#6e7681;padding:20px">No OAuth tokens configured</td></tr>';
+  if (tokens.length === 0) html = '<tr><td colspan="6" style="text-align:center;color:#6e7681;padding:20px">No OAuth tokens configured</td></tr>';
   tbody.innerHTML = html;
+}
+
+// Fetch the list of virtual keys bound to a given token id. Used by delete /
+// disable warnings so admins see exactly which users will be stranded.
+async function fetchBoundKeys(tokenId) {
+  try {
+    const res = await fetch(API + '/tokens/bindings?id=' + tokenId);
+    if (!res.ok) return [];
+    const data = await res.json();
+    return data.keys || [];
+  } catch(e) { return []; }
+}
+
+async function showBoundKeysFor(tokenId, tokenName) {
+  const keys = await fetchBoundKeys(tokenId);
+  if (keys.length === 0) {
+    alert('Token "' + tokenName + '" has no virtual keys bound to it.');
+    return;
+  }
+  const lines = keys.map(k => '• ' + k.name).join('\n');
+  alert('Virtual keys bound to "' + tokenName + '":\n\n' + lines);
 }
 function showAddTokenModal() { document.getElementById('newTokenName').value = ''; document.getElementById('newTokenValue').value = ''; document.getElementById('addTokenModal').classList.add('active'); document.getElementById('newTokenName').focus(); }
 function hideAddTokenModal() { document.getElementById('addTokenModal').classList.remove('active'); }
@@ -913,18 +980,40 @@ async function addOAuthToken() {
   await fetch(API + '/tokens', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ token, name: name || undefined }) });
   hideAddTokenModal(); showToast('Token added'); loadTokens();
 }
-async function toggleOAuthToken(id, disabled) {
+async function toggleOAuthToken(id, name, disabled) {
+  // Warn if disabling a token that bound virtual keys depend on — once it
+  // flips to disabled, any key that has *only* this token bound will start
+  // returning 503 immediately.
+  if (disabled) {
+    const bound = await fetchBoundKeys(id);
+    if (bound.length > 0) {
+      const names = bound.map(k => '  • ' + k.name).join('\n');
+      if (!confirm(
+        'Disable token "' + name + '"?\n\n' +
+        'It is bound by ' + bound.length + ' virtual key' + (bound.length>1?'s':'') + ':\n' + names +
+        '\n\nAny of those keys with no other enabled bound token will immediately fail with 503.'
+      )) return;
+    }
+  }
   await fetch(API + '/tokens/disable', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id, disabled }) });
-  showToast(disabled ? 'Token disabled' : 'Token enabled'); loadTokens();
+  showToast(disabled ? 'Token disabled' : 'Token enabled'); loadTokens(); loadKeys();
 }
 async function switchOAuthToken(id) {
   await fetch(API + '/tokens/switch', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id }) });
   showToast('Switched active token'); loadTokens();
 }
 async function removeOAuthToken(id, name) {
-  if (!confirm('Delete token "' + name + '"?')) return;
+  const bound = await fetchBoundKeys(id);
+  let msg = 'Delete token "' + name + '"?';
+  if (bound.length > 0) {
+    const names = bound.map(k => '  • ' + k.name).join('\n');
+    msg = 'Delete token "' + name + '"?\n\n' +
+      'It is currently bound by ' + bound.length + ' virtual key' + (bound.length>1?'s':'') + ':\n' + names +
+      '\n\nThose bindings will be removed along with the token.';
+  }
+  if (!confirm(msg)) return;
   await fetch(API + '/tokens', { method: 'DELETE', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id }) });
-  showToast('Token deleted'); loadTokens();
+  showToast('Token deleted'); loadTokens(); loadKeys();
 }
 
 // ── CSV Import ──
@@ -948,6 +1037,97 @@ async function importCSV(input) {
 async function copyKey(key, el) {
   try { await navigator.clipboard.writeText(key); const orig = el.textContent; el.textContent = 'copied!'; setTimeout(() => el.textContent = orig, 1500); }
   catch(e) { showToast('Copy failed — check clipboard permissions'); }
+}
+
+// ── Bindings Modal ──
+// _bindingsChosen is the ordered array of selected token IDs (index 0 = highest priority).
+// It is rebuilt on every open and committed via PUT /admin/api/keys/bindings.
+let _bindingsChosen = [];
+async function showBindingsModal(key, name) {
+  // Ensure token list is fresh.
+  if (_lastTokens.length === 0) { await loadTokens(); }
+  document.getElementById('bindingsKey').value = key;
+  document.getElementById('bindingsModalTitle').textContent = 'Bindings — ' + name;
+  // Fetch current bindings.
+  let current = [];
+  try {
+    const res = await fetch(API + '/keys/bindings?key=' + encodeURIComponent(key));
+    if (res.ok) {
+      const data = await res.json();
+      current = data.token_ids || [];
+    }
+  } catch(e) {}
+  _bindingsChosen = current.slice();
+  renderBindingsUI();
+  document.getElementById('bindingsModal').classList.add('active');
+}
+function hideBindingsModal() { document.getElementById('bindingsModal').classList.remove('active'); }
+function renderBindingsUI() {
+  // Chosen list (ordered, with up/down/remove controls).
+  const chosenDiv = document.getElementById('bindingsChosen');
+  const chosenIds = _bindingsChosen;
+  if (chosenIds.length === 0) {
+    chosenDiv.innerHTML = '<div style="padding:12px;color:#f85149;font-size:12px">⚠ No tokens selected — this key will be rejected until at least one token is bound.</div>';
+  } else {
+    let html = '';
+    chosenIds.forEach((tid, idx) => {
+      const t = _lastTokens.find(x => x.id === tid);
+      if (!t) return;
+      const disabledTag = t.disabled ? ' <span class="tag tag-red" style="font-size:10px">DISABLED</span>' : '';
+      html += '<div style="display:flex;align-items:center;gap:6px;padding:6px 8px;border-bottom:1px solid #21262d">' +
+        '<span style="color:#6e7681;font-size:11px;min-width:16px">' + (idx+1) + '.</span>' +
+        '<span style="flex:1">' + escHtml(t.name) + disabledTag + '</span>' +
+        '<button class="limit-edit" ' + (idx === 0 ? 'disabled style="opacity:0.3"' : 'onclick="moveBinding(' + idx + ',-1)"') + '>↑</button>' +
+        '<button class="limit-edit" ' + (idx === chosenIds.length-1 ? 'disabled style="opacity:0.3"' : 'onclick="moveBinding(' + idx + ',1)"') + '>↓</button>' +
+        '<button class="limit-edit" onclick="removeBinding(' + idx + ')">✕</button>' +
+        '</div>';
+    });
+    chosenDiv.innerHTML = html;
+  }
+  // Available list (tokens not in chosen set).
+  const availDiv = document.getElementById('bindingsAvailable');
+  const chosenSet = new Set(chosenIds);
+  const available = _lastTokens.filter(t => !chosenSet.has(t.id));
+  if (available.length === 0) {
+    availDiv.innerHTML = '<div style="padding:12px;color:#6e7681;font-size:12px">All tokens are already selected.</div>';
+  } else {
+    let html = '';
+    for (const t of available) {
+      const disabledTag = t.disabled ? ' <span class="tag tag-red" style="font-size:10px">DISABLED</span>' : '';
+      html += '<div style="display:flex;align-items:center;gap:6px;padding:6px 8px;border-bottom:1px solid #21262d">' +
+        '<span style="flex:1">' + escHtml(t.name) + disabledTag + '</span>' +
+        '<button class="btn btn-blue btn-sm" onclick="addBinding(' + t.id + ')">+ Add</button>' +
+        '</div>';
+    }
+    availDiv.innerHTML = html;
+  }
+}
+function addBinding(id) { _bindingsChosen.push(id); renderBindingsUI(); }
+function removeBinding(idx) { _bindingsChosen.splice(idx, 1); renderBindingsUI(); }
+function moveBinding(idx, delta) {
+  const target = idx + delta;
+  if (target < 0 || target >= _bindingsChosen.length) return;
+  const tmp = _bindingsChosen[idx];
+  _bindingsChosen[idx] = _bindingsChosen[target];
+  _bindingsChosen[target] = tmp;
+  renderBindingsUI();
+}
+async function saveBindings() {
+  const key = document.getElementById('bindingsKey').value;
+  const res = await fetch(API + '/keys/bindings', {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ key, token_ids: _bindingsChosen }),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    showToast('Save failed: ' + (err.error || res.status));
+    return;
+  }
+  hideBindingsModal();
+  showToast('Bindings saved');
+  loadKeys();
+  loadTokens();
 }
 
 // ── Budget Modal ──
@@ -979,9 +1159,10 @@ function showToast(msg) {
 // ── Modal close handlers ──
 document.getElementById('addModal').addEventListener('click', e => { if (e.target === e.currentTarget) hideAddModal(); });
 document.getElementById('budgetModal').addEventListener('click', e => { if (e.target === e.currentTarget) hideBudgetModal(); });
+document.getElementById('bindingsModal').addEventListener('click', e => { if (e.target === e.currentTarget) hideBindingsModal(); });
 document.getElementById('addTokenModal').addEventListener('click', e => { if (e.target === e.currentTarget) hideAddTokenModal(); });
 document.getElementById('feishuModal').addEventListener('click', e => { if (e.target === e.currentTarget) hideFeishuModal(); });
-document.addEventListener('keydown', e => { if (e.key === 'Escape') { hideAddModal(); hideBudgetModal(); hideAddTokenModal(); hideFeishuModal(); } });
+document.addEventListener('keydown', e => { if (e.key === 'Escape') { hideAddModal(); hideBudgetModal(); hideBindingsModal(); hideAddTokenModal(); hideFeishuModal(); } });
 
 // ── Rename Key ──
 async function renameKey(key, currentName) {

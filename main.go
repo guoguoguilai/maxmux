@@ -162,6 +162,27 @@ func (s *Store) migrate() error {
 	if err2 != nil {
 		return err2
 	}
+
+	// Virtual key -> OAuth token bindings.
+	// Each virtual key may be bound to one or more tokens, ordered by priority (ascending).
+	// When a bound key makes a request, maxmux picks the lowest-priority enabled token
+	// from this list; if all bound tokens are hard-disabled or soft-disabled (rate limited),
+	// the request is rejected. A virtual key with no bindings is rejected in strict mode.
+	_, err3 := s.db.Exec(`
+		CREATE TABLE IF NOT EXISTS virtual_key_token_bindings (
+			virtual_key TEXT NOT NULL,
+			token_id    INTEGER NOT NULL,
+			priority    INTEGER NOT NULL DEFAULT 0,
+			PRIMARY KEY (virtual_key, token_id),
+			FOREIGN KEY (virtual_key) REFERENCES virtual_keys(key) ON DELETE CASCADE,
+			FOREIGN KEY (token_id) REFERENCES oauth_tokens(id) ON DELETE CASCADE
+		);
+		CREATE INDEX IF NOT EXISTS idx_bindings_vk ON virtual_key_token_bindings(virtual_key, priority);
+		CREATE INDEX IF NOT EXISTS idx_bindings_tid ON virtual_key_token_bindings(token_id);
+	`)
+	if err3 != nil {
+		return err3
+	}
 	return nil
 }
 
@@ -224,8 +245,9 @@ func (s *Store) RemoveKey(key string) (bool, error) {
 	}
 	n, _ := res.RowsAffected()
 	if n > 0 {
-		// Also delete usage records for this key.
+		// Also delete usage records and token bindings for this key.
 		s.db.Exec("DELETE FROM usage_records WHERE virtual_key = ?", key)
+		s.db.Exec("DELETE FROM virtual_key_token_bindings WHERE virtual_key = ?", key)
 	}
 	return n > 0, nil
 }
@@ -306,8 +328,109 @@ func (s *Store) AddOAuthToken(token, name string) error {
 }
 
 func (s *Store) RemoveOAuthToken(id int) error {
+	// Cascade: also drop any virtual key bindings pointing at this token.
+	s.db.Exec("DELETE FROM virtual_key_token_bindings WHERE token_id = ?", id)
 	_, err := s.db.Exec("DELETE FROM oauth_tokens WHERE id = ?", id)
 	return err
+}
+
+// --- Virtual key <-> OAuth token bindings ---
+
+// KeyBinding represents a single virtual_key -> oauth_token binding with priority.
+type KeyBinding struct {
+	VirtualKey string `json:"virtual_key"`
+	TokenID    int    `json:"token_id"`
+	Priority   int    `json:"priority"`
+}
+
+// ListBindingsForKey returns all token bindings for a virtual key, ordered by priority asc.
+func (s *Store) ListBindingsForKey(virtualKey string) ([]KeyBinding, error) {
+	rows, err := s.db.Query(
+		"SELECT virtual_key, token_id, priority FROM virtual_key_token_bindings WHERE virtual_key = ? ORDER BY priority, token_id",
+		virtualKey,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var bindings []KeyBinding
+	for rows.Next() {
+		var b KeyBinding
+		if err := rows.Scan(&b.VirtualKey, &b.TokenID, &b.Priority); err != nil {
+			return nil, err
+		}
+		bindings = append(bindings, b)
+	}
+	return bindings, rows.Err()
+}
+
+// ListAllBindings returns every virtual_key -> token_id binding.
+func (s *Store) ListAllBindings() ([]KeyBinding, error) {
+	rows, err := s.db.Query("SELECT virtual_key, token_id, priority FROM virtual_key_token_bindings ORDER BY virtual_key, priority, token_id")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var bindings []KeyBinding
+	for rows.Next() {
+		var b KeyBinding
+		if err := rows.Scan(&b.VirtualKey, &b.TokenID, &b.Priority); err != nil {
+			return nil, err
+		}
+		bindings = append(bindings, b)
+	}
+	return bindings, rows.Err()
+}
+
+// ListKeysBoundToToken returns virtual key strings that are bound to the given token id.
+func (s *Store) ListKeysBoundToToken(tokenID int) ([]string, error) {
+	rows, err := s.db.Query(
+		"SELECT virtual_key FROM virtual_key_token_bindings WHERE token_id = ? ORDER BY virtual_key",
+		tokenID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var keys []string
+	for rows.Next() {
+		var k string
+		if err := rows.Scan(&k); err != nil {
+			return nil, err
+		}
+		keys = append(keys, k)
+	}
+	return keys, rows.Err()
+}
+
+// SetBindings replaces all bindings for a virtual key atomically. The provided
+// tokenIDs define the new binding set, and their position in the slice becomes
+// the priority (0 = highest). Duplicates are ignored (first occurrence wins).
+func (s *Store) SetBindings(virtualKey string, tokenIDs []int) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec("DELETE FROM virtual_key_token_bindings WHERE virtual_key = ?", virtualKey); err != nil {
+		return err
+	}
+	seen := make(map[int]bool, len(tokenIDs))
+	priority := 0
+	for _, id := range tokenIDs {
+		if seen[id] {
+			continue
+		}
+		seen[id] = true
+		if _, err := tx.Exec(
+			"INSERT INTO virtual_key_token_bindings (virtual_key, token_id, priority) VALUES (?, ?, ?)",
+			virtualKey, id, priority,
+		); err != nil {
+			return err
+		}
+		priority++
+	}
+	return tx.Commit()
 }
 
 func (s *Store) SetOAuthTokenDisabled(id int, disabled bool) error {
@@ -556,6 +679,10 @@ type keyInfo struct {
 	budgetLimitUSD float64
 	dailyLimitUSD  float64
 	disabled       bool
+	// boundTokenIDs is the ordered list of oauth token IDs this virtual key may
+	// use, ascending by priority. Empty means "no binding" — in strict mode the
+	// request is rejected.
+	boundTokenIDs []int
 }
 
 // KeyManager provides a fast in-memory cache for key validation.
@@ -578,12 +705,63 @@ func (m *KeyManager) reload() error {
 	if err != nil {
 		return err
 	}
+	bindings, err := m.store.ListAllBindings()
+	if err != nil {
+		return err
+	}
+	bindingMap := make(map[string][]int, len(keys))
+	for _, b := range bindings {
+		bindingMap[b.VirtualKey] = append(bindingMap[b.VirtualKey], b.TokenID)
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.keys = make(map[string]keyInfo, len(keys))
 	for _, k := range keys {
-		m.keys[k.Key] = keyInfo{name: k.Name, budgetLimitUSD: k.BudgetLimitUSD, dailyLimitUSD: k.DailyLimitUSD, disabled: k.Disabled}
+		m.keys[k.Key] = keyInfo{
+			name:           k.Name,
+			budgetLimitUSD: k.BudgetLimitUSD,
+			dailyLimitUSD:  k.DailyLimitUSD,
+			disabled:       k.Disabled,
+			boundTokenIDs:  bindingMap[k.Key],
+		}
 	}
+	return nil
+}
+
+// GetBoundTokenIDs returns a copy of the ordered bound token ID list for a virtual key.
+func (m *KeyManager) GetBoundTokenIDs(key string) []int {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	info, ok := m.keys[key]
+	if !ok || len(info.boundTokenIDs) == 0 {
+		return nil
+	}
+	out := make([]int, len(info.boundTokenIDs))
+	copy(out, info.boundTokenIDs)
+	return out
+}
+
+// SetBoundTokenIDs persists new bindings and updates the cache.
+func (m *KeyManager) SetBoundTokenIDs(key string, tokenIDs []int) error {
+	if err := m.store.SetBindings(key, tokenIDs); err != nil {
+		return err
+	}
+	// Dedupe while preserving order — mirror SetBindings behaviour.
+	seen := make(map[int]bool, len(tokenIDs))
+	cleaned := make([]int, 0, len(tokenIDs))
+	for _, id := range tokenIDs {
+		if seen[id] {
+			continue
+		}
+		seen[id] = true
+		cleaned = append(cleaned, id)
+	}
+	m.mu.Lock()
+	if info, ok := m.keys[key]; ok {
+		info.boundTokenIDs = cleaned
+		m.keys[key] = info
+	}
+	m.mu.Unlock()
 	return nil
 }
 
@@ -939,18 +1117,26 @@ func calcModelCost(model string, inputTokens, outputTokens, cacheWrite, cacheRea
 		float64(cacheRead)*inp*0.1) / 1_000_000
 }
 
+// softDisableDuration is how long a token stays soft-disabled after a 429/529
+// response from the upstream. Subsequent requests skip it until the timer
+// elapses, at which point it becomes eligible again.
+const softDisableDuration = 5 * time.Minute
+
 // TokenPool manages multiple OAuth tokens with automatic failover.
 // Uses the first enabled token by default; rotates to the next on 429/529 errors.
 type TokenPool struct {
 	mu      sync.RWMutex
 	tokens  []OAuthTokenEntry
 	current int // index into tokens
-	store   *Store
-	log     *zerolog.Logger
+	// softDisabledUntil tracks tokens temporarily skipped after a rate-limit
+	// response. Keyed by token ID.
+	softDisabledUntil map[int]time.Time
+	store             *Store
+	log               *zerolog.Logger
 }
 
 func NewTokenPool(store *Store, log *zerolog.Logger) *TokenPool {
-	tp := &TokenPool{store: store, log: log}
+	tp := &TokenPool{store: store, log: log, softDisabledUntil: make(map[int]time.Time)}
 	tp.Reload()
 	return tp
 }
@@ -1034,7 +1220,63 @@ func (tp *TokenPool) SetCurrent(id int) bool {
 	return false
 }
 
+// GetByID returns the token entry for the given id, or false if not present.
+func (tp *TokenPool) GetByID(id int) (OAuthTokenEntry, bool) {
+	tp.mu.RLock()
+	defer tp.mu.RUnlock()
+	for _, t := range tp.tokens {
+		if t.ID == id {
+			return t, true
+		}
+	}
+	return OAuthTokenEntry{}, false
+}
+
+// PickForKey iterates the bound token IDs in priority order and returns the
+// first one that is not hard-disabled and not currently soft-disabled. It
+// returns ("", 0, "") if nothing is available.
+func (tp *TokenPool) PickForKey(boundIDs []int) (token string, id int, name string) {
+	now := time.Now()
+	tp.mu.RLock()
+	defer tp.mu.RUnlock()
+	for _, wantID := range boundIDs {
+		for _, t := range tp.tokens {
+			if t.ID != wantID {
+				continue
+			}
+			if t.Disabled {
+				break
+			}
+			if until, ok := tp.softDisabledUntil[t.ID]; ok && now.Before(until) {
+				break
+			}
+			return t.Token, t.ID, t.Name
+		}
+	}
+	return "", 0, ""
+}
+
+// SoftDisableByToken marks the given token string as soft-disabled until the
+// configured cooldown elapses. Used when the upstream returns 429/529.
+func (tp *TokenPool) SoftDisableByToken(tokenValue string) {
+	tp.mu.Lock()
+	defer tp.mu.Unlock()
+	for _, t := range tp.tokens {
+		if t.Token == tokenValue {
+			tp.softDisabledUntil[t.ID] = time.Now().Add(softDisableDuration)
+			tp.log.Warn().
+				Int("id", t.ID).
+				Str("name", t.Name).
+				Str("token", maskToken(t.Token)).
+				Dur("cooldown", softDisableDuration).
+				Msg("soft-disabled token after rate limit")
+			return
+		}
+	}
+}
+
 type ctxStartKey struct{}
+type ctxUsedTokenKey struct{}
 
 func formatTokenCount(n int64) string {
 	if n >= 1_000_000 {
@@ -1059,7 +1301,7 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	json.NewEncoder(w).Encode(v)
 }
 
-var version = "v0.5.1"
+var version = "v0.6.0"
 
 func main() {
 	configPath := flag.String("config", "config.yaml", "path to config file")
@@ -1180,15 +1422,21 @@ func main() {
 
 	proxy := &httputil.ReverseProxy{
 		Director: func(req *http.Request) {
-			token := tokenPool.Current()
-			if token == "" {
-				token = oauthToken.Load().(string)
-			}
+			// The request handler picks the OAuth token for this request
+			// (honouring virtual-key bindings and soft-disable state) and
+			// stashes it in X-Maxmux-Used-Token before handing off to the
+			// proxy. Director consumes that value and injects it as the
+			// upstream Authorization header.
+			token := req.Header.Get("X-Maxmux-Used-Token")
+			req.Header.Del("X-Maxmux-Used-Token")
+
 			req.URL.Scheme = upstream.Scheme
 			req.URL.Host = upstream.Host
 			req.Host = upstream.Host
 
-			req.Header.Set("Authorization", "Bearer "+token)
+			if token != "" {
+				req.Header.Set("Authorization", "Bearer "+token)
+			}
 			req.Header.Del("X-Api-Key")
 			// Prevent gzip so the SSE reader sees plain text bytes.
 			req.Header.Del("Accept-Encoding")
@@ -1246,9 +1494,18 @@ func main() {
 				model, inputTokens, outputTokens, cacheCreation, cacheRead := extractFromBody(body)
 				reqStart, _ := resp.Request.Context().Value(ctxStartKey{}).(time.Time)
 				if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode == 529 {
-					// Try rotating to the next OAuth token.
-					if tokenPool.Rotate() {
-						log.Warn().Int("status", resp.StatusCode).Msg("upstream rate limited — rotated to next token")
+					// Soft-disable the specific token we used for this
+					// request, so that subsequent requests from any bound
+					// virtual key skip it until the cooldown elapses. Falls
+					// back to the legacy global rotate for requests that did
+					// not go through a bound virtual key.
+					usedToken, _ := resp.Request.Context().Value(ctxUsedTokenKey{}).(string)
+					if usedToken != "" {
+						tokenPool.SoftDisableByToken(usedToken)
+					} else {
+						if tokenPool.Rotate() {
+							log.Warn().Int("status", resp.StatusCode).Msg("upstream rate limited — rotated to next token")
+						}
 					}
 					// Strip retry headers so the SDK does not back-off and retry endlessly.
 					resp.Header.Del("Retry-After")
@@ -1399,6 +1656,11 @@ func main() {
 				CacheCreationInputTokens int64 `json:"cache_creation_input_tokens"`
 				CacheReadInputTokens     int64 `json:"cache_read_input_tokens"`
 			}
+			type boundTokenSummary struct {
+				ID       int    `json:"id"`
+				Name     string `json:"name"`
+				Disabled bool   `json:"disabled"`
+			}
 			type keyWithUsage struct {
 				Name                     string                    `json:"name"`
 				Key                      string                    `json:"key"`
@@ -1416,6 +1678,7 @@ func main() {
 				DailyLimitUSD            float64                   `json:"daily_limit_usd"`
 				CostTodayUSD             float64                   `json:"cost_today_usd"`
 				LastActive               *time.Time                `json:"last_active,omitempty"`
+				BoundTokens              []boundTokenSummary       `json:"bound_tokens"`
 			}
 			keys := keyMgr.List()
 			allUsage, err := store.QueryAll(from, to)
@@ -1449,6 +1712,15 @@ func main() {
 					totalSavings += float64(mu.CacheReadInputTokens) * inp * 0.9 / 1_000_000
 				}
 				costToday, _ := store.QueryKeyCostToday(k.Key)
+				// Resolve bound token summaries for the UI. Uses the keyMgr
+				// cache (not SQL) so this stays cheap for large key counts.
+				boundIDs := keyMgr.GetBoundTokenIDs(k.Key)
+				boundTokens := make([]boundTokenSummary, 0, len(boundIDs))
+				for _, tid := range boundIDs {
+					if t, ok := tokenPool.GetByID(tid); ok {
+						boundTokens = append(boundTokens, boundTokenSummary{ID: t.ID, Name: t.Name, Disabled: t.Disabled})
+					}
+				}
 				entry := keyWithUsage{
 					Name:                     k.Name,
 					Key:                      k.Key,
@@ -1465,6 +1737,7 @@ func main() {
 					BudgetLimitUSD:           k.BudgetLimitUSD,
 					DailyLimitUSD:            k.DailyLimitUSD,
 					CostTodayUSD:             math.Round(costToday*1000000) / 1000000,
+					BoundTokens:              boundTokens,
 				}
 				if !u.LastActive.IsZero() {
 					t := u.LastActive
@@ -1653,6 +1926,99 @@ func main() {
 			return
 		}
 
+		// Get token bindings for a virtual key.
+		if r.URL.Path == "/admin/api/keys/bindings" && r.Method == http.MethodGet {
+			if !requireAdmin(w, r) {
+				return
+			}
+			key := r.URL.Query().Get("key")
+			if key == "" {
+				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "key is required"})
+				return
+			}
+			writeJSON(w, http.StatusOK, map[string]any{
+				"key":       key,
+				"token_ids": keyMgr.GetBoundTokenIDs(key),
+			})
+			return
+		}
+
+		// Replace token bindings for a virtual key. The token_ids array defines
+		// priority (index 0 = highest). Pass an empty array to clear bindings;
+		// note that an unbound key cannot serve traffic under strict mode.
+		if r.URL.Path == "/admin/api/keys/bindings" && r.Method == http.MethodPut {
+			if !requireAdmin(w, r) {
+				return
+			}
+			var req struct {
+				Key      string `json:"key"`
+				TokenIDs []int  `json:"token_ids"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Key == "" {
+				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "key is required"})
+				return
+			}
+			if !keyMgr.IsValid(req.Key) {
+				writeJSON(w, http.StatusNotFound, map[string]string{"error": "virtual key not found"})
+				return
+			}
+			// Validate every supplied token id exists in the pool.
+			for _, id := range req.TokenIDs {
+				if _, ok := tokenPool.GetByID(id); !ok {
+					writeJSON(w, http.StatusBadRequest, map[string]string{"error": fmt.Sprintf("token id %d not found", id)})
+					return
+				}
+			}
+			if err := keyMgr.SetBoundTokenIDs(req.Key, req.TokenIDs); err != nil {
+				log.Error().Err(err).Msg("failed to update bindings")
+				writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
+				return
+			}
+			log.Info().Str("key", maskToken(req.Key)).Ints("token_ids", req.TokenIDs).Msg("bindings updated")
+			writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+			return
+		}
+
+		// Reverse lookup: which virtual keys are bound to this OAuth token?
+		// Used by the token management UI to warn administrators before a
+		// delete or disable that would strand bound users.
+		if r.URL.Path == "/admin/api/tokens/bindings" && r.Method == http.MethodGet {
+			if !requireAdmin(w, r) {
+				return
+			}
+			idStr := r.URL.Query().Get("id")
+			id, err := strconv.Atoi(idStr)
+			if err != nil || id <= 0 {
+				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "id is required"})
+				return
+			}
+			keys, err := store.ListKeysBoundToToken(id)
+			if err != nil {
+				log.Error().Err(err).Msg("failed to list bindings for token")
+				writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
+				return
+			}
+			// Enrich with human-readable names.
+			type boundKey struct {
+				Key  string `json:"key"`
+				Name string `json:"name"`
+			}
+			all := keyMgr.List()
+			nameByKey := make(map[string]string, len(all))
+			for _, k := range all {
+				nameByKey[k.Key] = k.Name
+			}
+			result := make([]boundKey, 0, len(keys))
+			for _, k := range keys {
+				result = append(result, boundKey{Key: k, Name: nameByKey[k]})
+			}
+			writeJSON(w, http.StatusOK, map[string]any{
+				"token_id": id,
+				"keys":     result,
+			})
+			return
+		}
+
 		// Disable/enable a key.
 		if r.URL.Path == "/admin/api/keys/disable" && r.Method == http.MethodPut {
 			if !requireAdmin(w, r) {
@@ -1697,23 +2063,32 @@ func main() {
 			}
 			// Mask token values in response.
 			type maskedToken struct {
-				ID        int    `json:"id"`
-				Name      string `json:"name"`
-				Masked    string `json:"masked_token"`
-				Disabled  bool   `json:"disabled"`
-				SortOrder int    `json:"sort_order"`
-				Active    bool   `json:"active"`
+				ID            int    `json:"id"`
+				Name          string `json:"name"`
+				Masked        string `json:"masked_token"`
+				Disabled      bool   `json:"disabled"`
+				SortOrder     int    `json:"sort_order"`
+				Active        bool   `json:"active"`
+				BoundKeyCount int    `json:"bound_key_count"`
 			}
 			activeToken := tokenPool.Current()
+			// Build a token_id -> count map in one pass over all bindings so
+			// the N-token GET stays O(bindings + tokens) rather than O(N SQL).
+			allBindings, _ := store.ListAllBindings()
+			countByToken := make(map[int]int, len(tokens))
+			for _, b := range allBindings {
+				countByToken[b.TokenID]++
+			}
 			result := make([]maskedToken, len(tokens))
 			for i, t := range tokens {
 				result[i] = maskedToken{
-					ID:        t.ID,
-					Name:      t.Name,
-					Masked:    maskToken(t.Token),
-					Disabled:  t.Disabled,
-					SortOrder: t.SortOrder,
-					Active:    t.Token == activeToken,
+					ID:            t.ID,
+					Name:          t.Name,
+					Masked:        maskToken(t.Token),
+					Disabled:      t.Disabled,
+					SortOrder:     t.SortOrder,
+					Active:        t.Token == activeToken,
+					BoundKeyCount: countByToken[t.ID],
 				}
 			}
 			writeJSON(w, http.StatusOK, result)
@@ -2071,6 +2446,34 @@ func main() {
 			return
 		}
 
+		// Strict binding enforcement: every virtual key must be explicitly
+		// bound to one or more OAuth tokens. Unbound keys are rejected so an
+		// administrator cannot accidentally route a new user through the
+		// shared pool. The pick honours priority order and skips any token
+		// that is hard-disabled or currently soft-disabled (rate limited).
+		bound := keyMgr.GetBoundTokenIDs(virtualKey)
+		if len(bound) == 0 {
+			log.Warn().
+				Str("key", maskToken(virtualKey)).
+				Msg("rejected — key has no token bindings")
+			http.Error(w, `{"error":{"message":"this key is not bound to any OAuth token — contact the administrator","type":"authentication_error"}}`, http.StatusForbidden)
+			return
+		}
+		chosenToken, chosenTokenID, chosenTokenName := tokenPool.PickForKey(bound)
+		if chosenToken == "" {
+			log.Warn().
+				Str("key", maskToken(virtualKey)).
+				Int("bound_tokens", len(bound)).
+				Msg("rejected — all bound tokens unavailable (disabled or rate limited)")
+			http.Error(w, `{"error":{"message":"all bound tokens are currently unavailable — please retry later","type":"rate_limit_error"}}`, http.StatusServiceUnavailable)
+			return
+		}
+		log.Debug().
+			Str("key", maskToken(virtualKey)).
+			Int("token_id", chosenTokenID).
+			Str("token_name", chosenTokenName).
+			Msg("selected bound token")
+
 		// Check budget limit.
 		if budget := keyMgr.GetBudget(virtualKey); budget > 0 {
 			cost, err := store.QueryKeyCost(virtualKey)
@@ -2112,9 +2515,12 @@ func main() {
 		}
 
 		r.Header.Set("X-Maxmux-Virtual-Key", virtualKey)
+		r.Header.Set("X-Maxmux-Used-Token", chosenToken)
 
-		// Inject start time into context so ModifyResponse can compute duration.
+		// Inject start time + chosen token into context so Director /
+		// ModifyResponse can track which token was used for this request.
 		ctx := context.WithValue(r.Context(), ctxStartKey{}, start)
+		ctx = context.WithValue(ctx, ctxUsedTokenKey{}, chosenToken)
 		proxy.ServeHTTP(w, r.WithContext(ctx))
 	})
 
