@@ -2,7 +2,7 @@
 set -e
 
 IMAGE="pageguo/maxmux"
-VERSION=$(grep -oP 'var version = "\K[^"]+' main.go)
+VERSION=$(sed -n 's/^var version = "\([^"]*\)".*/\1/p' main.go)
 
 if [ -z "$VERSION" ]; then
   echo "Error: could not read version from main.go"
