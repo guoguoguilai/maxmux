@@ -42,13 +42,14 @@ type AdminConfig struct {
 }
 
 type Config struct {
-	Port           int                `yaml:"port"`
-	Upstream       string             `yaml:"upstream"`
-	OAuthToken     string             `yaml:"oauth_token"`
-	OAuthTokens    []string           `yaml:"oauth_tokens"`
-	Admin          AdminConfig        `yaml:"admin"`
-	SeedKeys       []VirtualKeyConfig `yaml:"virtual_keys"`
-	FeishuWebhook  string             `yaml:"feishu_webhook"`
+	Port              int                `yaml:"port"`
+	Upstream          string             `yaml:"upstream"`
+	OAuthToken        string             `yaml:"oauth_token"`
+	OAuthTokens       []string           `yaml:"oauth_tokens"`
+	Admin             AdminConfig        `yaml:"admin"`
+	SeedKeys          []VirtualKeyConfig `yaml:"virtual_keys"`
+	FeishuWebhook     string             `yaml:"feishu_webhook"`
+	EnforceClaudeCode *bool              `yaml:"enforce_claude_code"`
 }
 
 // UsageRecord stores a single request's usage data with timestamp.
@@ -1071,6 +1072,10 @@ func loadConfig(path string) (*Config, error) {
 	if cfg.Upstream == "" {
 		cfg.Upstream = "https://api.anthropic.com"
 	}
+	if cfg.EnforceClaudeCode == nil {
+		t := true
+		cfg.EnforceClaudeCode = &t
+	}
 	return &cfg, nil
 }
 
@@ -1295,13 +1300,35 @@ func maskToken(t string) string {
 	return t[:12] + "..." + t[len(t)-6:]
 }
 
+// isClaudeCodeRequest checks whether the incoming request looks like it
+// originates from the official Claude Code CLI / SDK. The heuristic examines
+// the User-Agent header which the SDK always sets to a value starting with
+// "claude-cli/" or containing "ClaudeCode". Requests made via plain curl,
+// the Anthropic Python/TS SDK, or other tools will not match.
+func isClaudeCodeRequest(r *http.Request) bool {
+	ua := r.Header.Get("User-Agent")
+	if ua == "" {
+		return false
+	}
+	ua = strings.ToLower(ua)
+	// Claude Code CLI: "claude-cli/2.1.63 (external, cli)"
+	if strings.HasPrefix(ua, "claude-cli/") {
+		return true
+	}
+	// Claude Code extensions might use different variants
+	if strings.Contains(ua, "claudecode") {
+		return true
+	}
+	return false
+}
+
 func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	json.NewEncoder(w).Encode(v)
 }
 
-var version = "v0.6.0"
+var version = "v0.6.1"
 
 func main() {
 	configPath := flag.String("config", "config.yaml", "path to config file")
@@ -2443,6 +2470,17 @@ func main() {
 				Str("key", maskToken(virtualKey)).
 				Msg("rejected — key is disabled")
 			http.Error(w, `{"error":{"message":"this key has been disabled by the administrator","type":"authentication_error"}}`, http.StatusForbidden)
+			return
+		}
+
+		// Enforce Claude Code SDK origin when configured.
+		if *cfg.EnforceClaudeCode && !isClaudeCodeRequest(r) {
+			log.Warn().
+				Str("key", maskToken(virtualKey)).
+				Str("user_agent", r.Header.Get("User-Agent")).
+				Str("remote", r.RemoteAddr).
+				Msg("rejected — not a Claude Code SDK request")
+			http.Error(w, `{"error":{"message":"this proxy only accepts requests from the Claude Code CLI","type":"authentication_error"}}`, http.StatusForbidden)
 			return
 		}
 
