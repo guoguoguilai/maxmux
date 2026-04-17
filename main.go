@@ -443,16 +443,26 @@ func (s *Store) SetOAuthTokenDisabled(id int, disabled bool) error {
 	return err
 }
 
-// QueryKeyCostToday calculates the estimated cost for a key since midnight UTC today.
+func (s *Store) RenameOAuthToken(id int, name string) error {
+	_, err := s.db.Exec("UPDATE oauth_tokens SET name = ? WHERE id = ?", name, id)
+	return err
+}
+
+func (s *Store) UpdateOAuthTokenValue(id int, token string) error {
+	_, err := s.db.Exec("UPDATE oauth_tokens SET token = ? WHERE id = ?", token, id)
+	return err
+}
+
+// QueryKeyCostToday calculates the estimated cost for a key since midnight local time today.
 func (s *Store) QueryKeyCostToday(key string) (float64, error) {
-	todayUTC := time.Now().UTC().Truncate(24 * time.Hour).Format(time.RFC3339)
+	todayLocal := time.Now().Truncate(24 * time.Hour).UTC().Format(time.RFC3339)
 	rows, err := s.db.Query(
 		`SELECT model,
 			SUM(input_tokens), SUM(output_tokens),
 			SUM(cache_creation_input_tokens), SUM(cache_read_input_tokens)
 		 FROM usage_records
 		 WHERE virtual_key = ? AND timestamp >= ?
-		 GROUP BY model`, key, todayUTC)
+		 GROUP BY model`, key, todayLocal)
 	if err != nil {
 		return 0, err
 	}
@@ -1328,7 +1338,7 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	json.NewEncoder(w).Encode(v)
 }
 
-var version = "v0.6.1"
+var version = "v0.6.2"
 
 func main() {
 	configPath := flag.String("config", "config.yaml", "path to config file")
@@ -2212,6 +2222,62 @@ func main() {
 				writeJSON(w, http.StatusNotFound, map[string]string{"error": "token not found"})
 				return
 			}
+			writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+			return
+		}
+
+		// Rename a token.
+		if r.URL.Path == "/admin/api/tokens/rename" && r.Method == http.MethodPut {
+			if !requireAdmin(w, r) {
+				return
+			}
+			var req struct {
+				ID   int    `json:"id"`
+				Name string `json:"name"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request"})
+				return
+			}
+			if req.Name == "" {
+				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "name is required"})
+				return
+			}
+			if err := store.RenameOAuthToken(req.ID, req.Name); err != nil {
+				log.Error().Err(err).Msg("failed to rename token")
+				writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
+				return
+			}
+			tokenPool.Reload()
+			log.Info().Int("id", req.ID).Str("name", req.Name).Msg("token renamed")
+			writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+			return
+		}
+
+		// Update a token's value.
+		if r.URL.Path == "/admin/api/tokens/value" && r.Method == http.MethodPut {
+			if !requireAdmin(w, r) {
+				return
+			}
+			var req struct {
+				ID    int    `json:"id"`
+				Token string `json:"token"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request"})
+				return
+			}
+			if req.Token == "" {
+				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "token is required"})
+				return
+			}
+			if err := store.UpdateOAuthTokenValue(req.ID, req.Token); err != nil {
+				log.Error().Err(err).Msg("failed to update token value")
+				writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
+				return
+			}
+			tokenPool.Reload()
+			log.Info().Int("id", req.ID).Str("token", maskToken(req.Token)).Msg("token value updated")
 			writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 			return
 		}

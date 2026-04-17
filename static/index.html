@@ -343,7 +343,7 @@
     <div class="form-group">
       <label>Daily Limit (USD)</label>
       <input type="number" id="budgetDaily" placeholder="0 = unlimited" min="0" step="0.01">
-      <div class="modal-hint">Resets at midnight UTC each day. 0 = no limit.</div>
+      <div class="modal-hint">Resets at local midnight each day. 0 = no limit.</div>
     </div>
     <div class="modal-actions">
       <button class="btn btn-secondary" onclick="hideBudgetModal()">Cancel</button>
@@ -388,6 +388,27 @@
     <div class="modal-actions">
       <button class="btn btn-secondary" onclick="hideAddTokenModal()">Cancel</button>
       <button class="btn btn-blue" onclick="addOAuthToken()">Add Token</button>
+    </div>
+  </div>
+</div>
+
+<!-- Edit Token Modal -->
+<div class="modal-overlay" id="editTokenModal">
+  <div class="modal">
+    <h2>Edit Token</h2>
+    <input type="hidden" id="editTokenId">
+    <div class="form-group">
+      <label>Name</label>
+      <input type="text" id="editTokenName" placeholder="Token name">
+    </div>
+    <div class="form-group">
+      <label>Token Value</label>
+      <input type="text" id="editTokenValue" placeholder="Leave empty to keep current value">
+      <div class="modal-hint">Leave empty to keep the current token value unchanged.</div>
+    </div>
+    <div class="modal-actions">
+      <button class="btn btn-secondary" onclick="hideEditTokenModal()">Cancel</button>
+      <button class="btn btn-blue" onclick="saveEditToken()">Save</button>
     </div>
   </div>
 </div>
@@ -927,12 +948,10 @@ async function loadTokens() {
   if (!tbody) return;
   let html = '';
   for (const t of tokens) {
-    const activeTag = t.active ? ' <span class="tag tag-green" style="margin-left:4px">IN USE</span>' : '';
     const statusTag = t.disabled ? '<span class="tag tag-red">Disabled</span>' : '<span class="tag tag-green">Enabled</span>';
     const toggleBtn = t.disabled
       ? '<button class="btn btn-primary btn-sm" onclick="toggleOAuthToken('+t.id+',\''+escAttr(t.name)+'\',false)">Enable</button>'
       : '<button class="btn btn-secondary btn-sm" onclick="toggleOAuthToken('+t.id+',\''+escAttr(t.name)+'\',true)">Disable</button>';
-    const useBtn = (t.active || t.disabled) ? '' : ' <button class="btn btn-blue btn-sm" onclick="switchOAuthToken('+t.id+')">Use</button>';
     const rowStyle = t.disabled ? ' style="opacity:0.5"' : '';
     const boundCount = t.bound_key_count || 0;
     const boundCell = boundCount > 0
@@ -940,11 +959,13 @@ async function loadTokens() {
       : '<span style="color:#6e7681">—</span>';
     html += '<tr'+rowStyle+'>' +
       '<td class="mono">'+t.sort_order+'</td>' +
-      '<td class="name-cell">'+escHtml(t.name)+activeTag+'</td>' +
+      '<td class="name-cell">'+escHtml(t.name)+'</td>' +
       '<td class="mono">'+escHtml(t.masked_token)+'</td>' +
       '<td>'+statusTag+'</td>' +
       '<td>'+boundCell+'</td>' +
-      '<td style="white-space:nowrap">'+useBtn+' '+toggleBtn+
+      '<td style="white-space:nowrap">' +
+      '<button class="btn btn-secondary btn-sm" onclick="showEditTokenModal('+t.id+',\''+escAttr(t.name)+'\')">Edit</button> ' +
+      toggleBtn+
       ' <button class="btn btn-danger btn-sm" onclick="removeOAuthToken('+t.id+',\''+escAttr(t.name)+'\')">Delete</button></td></tr>';
   }
   if (tokens.length === 0) html = '<tr><td colspan="6" style="text-align:center;color:#6e7681;padding:20px">No OAuth tokens configured</td></tr>';
@@ -1014,6 +1035,26 @@ async function removeOAuthToken(id, name) {
   if (!confirm(msg)) return;
   await fetch(API + '/tokens', { method: 'DELETE', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id }) });
   showToast('Token deleted'); loadTokens(); loadKeys();
+}
+
+function showEditTokenModal(id, name) {
+  document.getElementById('editTokenId').value = id;
+  document.getElementById('editTokenName').value = name;
+  document.getElementById('editTokenValue').value = '';
+  document.getElementById('editTokenModal').classList.add('active');
+  document.getElementById('editTokenName').focus();
+}
+function hideEditTokenModal() { document.getElementById('editTokenModal').classList.remove('active'); }
+async function saveEditToken() {
+  const id = parseInt(document.getElementById('editTokenId').value);
+  const name = document.getElementById('editTokenName').value.trim();
+  const token = document.getElementById('editTokenValue').value.trim();
+  if (!name) { showToast('Name is required'); return; }
+  await fetch(API + '/tokens/rename', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id, name }) });
+  if (token) {
+    await fetch(API + '/tokens/value', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id, token }) });
+  }
+  hideEditTokenModal(); showToast('Token updated'); loadTokens();
 }
 
 // ── CSV Import ──
@@ -1161,6 +1202,7 @@ document.getElementById('addModal').addEventListener('click', e => { if (e.targe
 document.getElementById('budgetModal').addEventListener('click', e => { if (e.target === e.currentTarget) hideBudgetModal(); });
 document.getElementById('bindingsModal').addEventListener('click', e => { if (e.target === e.currentTarget) hideBindingsModal(); });
 document.getElementById('addTokenModal').addEventListener('click', e => { if (e.target === e.currentTarget) hideAddTokenModal(); });
+document.getElementById('editTokenModal').addEventListener('click', e => { if (e.target === e.currentTarget) hideEditTokenModal(); });
 document.getElementById('feishuModal').addEventListener('click', e => { if (e.target === e.currentTarget) hideFeishuModal(); });
 document.addEventListener('keydown', e => { if (e.key === 'Escape') { hideAddModal(); hideBudgetModal(); hideBindingsModal(); hideAddTokenModal(); hideFeishuModal(); } });
 

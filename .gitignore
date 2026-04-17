@@ -1,3 +1,6 @@
 data/
 config.yaml
 keys.csv
+maxmux
+.claude/settings.local.json
+.omc/
