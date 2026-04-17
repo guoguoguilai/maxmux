@@ -1290,6 +1290,35 @@ func (tp *TokenPool) SoftDisableByToken(tokenValue string) {
 	}
 }
 
+// HardDisableByToken permanently disables the given token (writes disabled=1
+// to the DB and updates the in-memory copy). Used when upstream returns
+// 401/403, which indicates an expired or revoked OAuth token that will not
+// recover on its own — the token must be manually re-enabled after refresh.
+func (tp *TokenPool) HardDisableByToken(tokenValue string, statusCode int) {
+	tp.mu.Lock()
+	defer tp.mu.Unlock()
+	for i, t := range tp.tokens {
+		if t.Token != tokenValue {
+			continue
+		}
+		if t.Disabled {
+			return
+		}
+		if err := tp.store.SetOAuthTokenDisabled(t.ID, true); err != nil {
+			tp.log.Error().Err(err).Int("id", t.ID).Msg("failed to hard-disable token")
+			return
+		}
+		tp.tokens[i].Disabled = true
+		tp.log.Error().
+			Int("id", t.ID).
+			Str("name", t.Name).
+			Str("token", maskToken(t.Token)).
+			Int("status", statusCode).
+			Msg("HARD-DISABLED token: upstream rejected credentials (expired/revoked) — re-enable after refreshing the token")
+		return
+	}
+}
+
 type ctxStartKey struct{}
 type ctxUsedTokenKey struct{}
 
@@ -1338,7 +1367,7 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	json.NewEncoder(w).Encode(v)
 }
 
-var version = "v0.6.2"
+var version = "v0.6.3"
 
 func main() {
 	configPath := flag.String("config", "config.yaml", "path to config file")
@@ -1530,6 +1559,15 @@ func main() {
 
 				model, inputTokens, outputTokens, cacheCreation, cacheRead := extractFromBody(body)
 				reqStart, _ := resp.Request.Context().Value(ctxStartKey{}).(time.Time)
+				if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+					// Expired or revoked OAuth token — hard-disable it so
+					// subsequent requests pick the next bound token instead of
+					// retrying a dead credential forever.
+					usedToken, _ := resp.Request.Context().Value(ctxUsedTokenKey{}).(string)
+					if usedToken != "" {
+						tokenPool.HardDisableByToken(usedToken, resp.StatusCode)
+					}
+				}
 				if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode == 529 {
 					// Soft-disable the specific token we used for this
 					// request, so that subsequent requests from any bound
