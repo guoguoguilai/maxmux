@@ -1137,6 +1137,12 @@ func calcModelCost(model string, inputTokens, outputTokens, cacheWrite, cacheRea
 // elapses, at which point it becomes eligible again.
 const softDisableDuration = 5 * time.Minute
 
+// authFailDisableDuration is how long a token stays soft-disabled after a
+// 401/403 response. OAuth tokens expire and get refreshed on the client side,
+// so auth failures are treated as transient: the token is parked for a while
+// and retried later instead of being permanently hard-disabled.
+const authFailDisableDuration = 30 * time.Minute
+
 // TokenPool manages multiple OAuth tokens with automatic failover.
 // Uses the first enabled token by default; rotates to the next on 429/529 errors.
 type TokenPool struct {
@@ -1290,10 +1296,33 @@ func (tp *TokenPool) SoftDisableByToken(tokenValue string) {
 	}
 }
 
+// SoftDisableByTokenFor marks the given token string as soft-disabled for the
+// specified duration. Used for 401/403 auth failures where the token is
+// assumed to be an expired (but refreshable) OAuth credential rather than a
+// permanently revoked one.
+func (tp *TokenPool) SoftDisableByTokenFor(tokenValue string, d time.Duration, statusCode int) {
+	tp.mu.Lock()
+	defer tp.mu.Unlock()
+	for _, t := range tp.tokens {
+		if t.Token == tokenValue {
+			tp.softDisabledUntil[t.ID] = time.Now().Add(d)
+			tp.log.Warn().
+				Int("id", t.ID).
+				Str("name", t.Name).
+				Str("token", maskToken(t.Token)).
+				Int("status", statusCode).
+				Dur("cooldown", d).
+				Msg("soft-disabled token after auth failure (expired or revoked) — will retry after cooldown")
+			return
+		}
+	}
+}
+
 // HardDisableByToken permanently disables the given token (writes disabled=1
-// to the DB and updates the in-memory copy). Used when upstream returns
-// 401/403, which indicates an expired or revoked OAuth token that will not
-// recover on its own — the token must be manually re-enabled after refresh.
+// to the DB and updates the in-memory copy). Retained for administrative use;
+// no longer called automatically on upstream auth failures since OAuth tokens
+// regularly expire and refresh on the client side — auth failures now go
+// through SoftDisableByTokenFor instead.
 func (tp *TokenPool) HardDisableByToken(tokenValue string, statusCode int) {
 	tp.mu.Lock()
 	defer tp.mu.Unlock()
@@ -1367,7 +1396,7 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	json.NewEncoder(w).Encode(v)
 }
 
-var version = "v0.6.3"
+var version = "v0.6.4"
 
 func main() {
 	configPath := flag.String("config", "config.yaml", "path to config file")
@@ -1560,12 +1589,14 @@ func main() {
 				model, inputTokens, outputTokens, cacheCreation, cacheRead := extractFromBody(body)
 				reqStart, _ := resp.Request.Context().Value(ctxStartKey{}).(time.Time)
 				if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
-					// Expired or revoked OAuth token — hard-disable it so
-					// subsequent requests pick the next bound token instead of
-					// retrying a dead credential forever.
+					// Likely an expired OAuth token. Park it for a while
+					// (long soft-disable) so subsequent requests fail over to
+					// the next bound token; the client refreshes the token on
+					// its side and the parked one becomes eligible again once
+					// the cooldown elapses.
 					usedToken, _ := resp.Request.Context().Value(ctxUsedTokenKey{}).(string)
 					if usedToken != "" {
-						tokenPool.HardDisableByToken(usedToken, resp.StatusCode)
+						tokenPool.SoftDisableByTokenFor(usedToken, authFailDisableDuration, resp.StatusCode)
 					}
 				}
 				if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode == 529 {
