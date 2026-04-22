@@ -1170,6 +1170,16 @@ func (tp *TokenPool) Reload() {
 	}
 	tp.mu.Lock()
 	defer tp.mu.Unlock()
+	active := make(map[int]OAuthTokenEntry, len(tokens))
+	for _, t := range tokens {
+		active[t.ID] = t
+	}
+	for id, until := range tp.softDisabledUntil {
+		t, ok := active[id]
+		if !ok || t.Disabled || time.Now().After(until) {
+			delete(tp.softDisabledUntil, id)
+		}
+	}
 	tp.tokens = tokens
 	// Reset current to first enabled token.
 	tp.current = -1
@@ -1179,6 +1189,12 @@ func (tp *TokenPool) Reload() {
 			break
 		}
 	}
+}
+
+func (tp *TokenPool) ClearSoftDisableByID(id int) {
+	tp.mu.Lock()
+	defer tp.mu.Unlock()
+	delete(tp.softDisabledUntil, id)
 }
 
 // Current returns the current active OAuth token string.
@@ -1396,7 +1412,7 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	json.NewEncoder(w).Encode(v)
 }
 
-var version = "v0.6.4"
+var version = "v0.6.5"
 
 func main() {
 	configPath := flag.String("config", "config.yaml", "path to config file")
@@ -2247,6 +2263,11 @@ func main() {
 				writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
 				return
 			}
+			if err := keyMgr.reload(); err != nil {
+				log.Error().Err(err).Msg("failed to reload key bindings after token removal")
+				writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
+				return
+			}
 			tokenPool.Reload()
 			log.Info().Int("id", req.ID).Msg("oauth token removed")
 			writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
@@ -2269,6 +2290,9 @@ func main() {
 				log.Error().Err(err).Msg("failed to set token disabled")
 				writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
 				return
+			}
+			if !req.Disabled {
+				tokenPool.ClearSoftDisableByID(req.ID)
 			}
 			tokenPool.Reload()
 			writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
@@ -2345,6 +2369,7 @@ func main() {
 				writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
 				return
 			}
+			tokenPool.ClearSoftDisableByID(req.ID)
 			tokenPool.Reload()
 			log.Info().Int("id", req.ID).Str("token", maskToken(req.Token)).Msg("token value updated")
 			writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
