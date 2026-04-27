@@ -814,39 +814,10 @@ git push agi master --tags
   跑 `claude setup-token`、复制结果、粘贴进 maxmux。CLIProxyAPI 在管理 UI 里
   实现了完整的 PKCE OAuth 流程，应该把这个移植过来——加新账号变成"点按钮
   → 登录 → 完成"。
-- **用量看板增强** [来自 CLIProxyAPI]。CLIProxyAPI 的 TUI 通过
-  `/v0/management/usage` 暴露了按 token 拆分的 RPM/TPM、模型分布、延迟
-  直方图。我们后端已经有原始数据，主要是 UI/JS 投入。
 - **管理页面上提示绑定语义**。一行小 banner 写明"严格模式：未绑定的 key
   无法使用"，避免新人首次升级时困惑。
 - **软禁用状态持久化**到数据库——这样在 Claude 限流密集的时候重启 maxmux
   不会让一个抖动的 token 又被悄悄启用。
-
-### 中期
-
-- **新成员 OAuth 一站式接入**。把网页 OAuth + 自动绑定打包成一个向导：登录
-  新 Anthropic 账号 → token + 虚拟 key + 绑定一次完成。
-- **绑定集合内的主动重试**，不只是惰性。这就是当时刻意延期的"路径 2"重构。
-  把 `httputil.ReverseProxy` 换成手写的 `http.Client` 循环，让 429 在**同一次
-  请求里**跨绑定集合重试，而不是让客户端自己看到 429 再 retry。
-- **TLS / 设备画像伪造** [来自 CLIProxyAPI]。目前可选——只在 Anthropic 启用
-  主动指纹检测时才必要。加 uTLS + Stainless headers 大约 500 行代码，但隔离
-  得很好。
-- **多租户隔离**。今天管理员看到所有数据。租户范围内的管理员（比如团队
-  leader）对大一些的团队会有用。
-
-### 长期 / 锦上添花
-
-- **配置热加载**——目前改 `config.yaml` 必须重启才生效（DB 里的状态已经可
-  以热改了）。
-- **Prometheus metrics 端点** —— `/metrics` 暴露按 key、按 token 的请求计数和
-  延迟直方图。
-- **限流事件 webhook**——Feishu 日报之外，token 被软禁用时立刻触发 webhook，
-  让管理员能主动响应。
-- **可选的 Postgres 替代 SQLite**——目前单写者模型对我们团队规模够用，但如果
-  以后要 HA 就不行了。
-- **headless 服务器用的 `maxmuxctl` CLI**——管理 API 够用但 `curl | jq` 不够
-  友好。
 
 ---
 
